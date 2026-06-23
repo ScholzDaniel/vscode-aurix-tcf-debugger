@@ -1,0 +1,365 @@
+{
+  "name": "vscode-aurix-tcf-debug",
+  "description": "AURIX™ Target Communication Framework (TCF) debugger",
+  "displayName": "AURIX™ TCF Debugger",
+  "icon": "media/debugger-icon.png",
+  "publisher": "zehuazhang",
+  "version": "0.1.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ZeZhan/vscode-aurix-tcf-debugger.git"
+  },
+  "homepage": "https://github.com/ZeZhan/vscode-aurix-tcf-debugger",
+  "bugs": {
+    "url": "https://github.com/ZeZhan/vscode-aurix-tcf-debugger/issues"
+  },
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.79.0"
+  },
+  "categories": [
+    "Debuggers"
+  ],
+  "keywords": [
+    "aurix",
+    "tricore",
+    "embedded",
+    "debugger",
+    "vscode",
+    "tcf",
+    "tcf-dap",
+    "vscode-extension",
+    "infineon"
+  ],
+  "activationEvents": [
+    "onDebug",
+    "onDebugResolve:aurix-tcf"
+  ],
+  "extensionDependencies": [
+    "mcu-debug.peripheral-viewer",
+    "eclipse-cdt.memory-inspector"
+  ],
+  "main": "./out/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Path mapper function execution may be disabled."
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./ && node ./scripts/copy-static-assets.js",
+    "watch": "tsc -watch -p ./",
+    "svd:compress": "node ./scripts/compress-svd.js --delete",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js",
+    "test:stress": "pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-stress.ps1",
+    "package": "npx vsce package --no-rewrite-relative-links -o vscode-aurix-tcf-debug.vsix"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.6",
+    "@types/node": "20.x",
+    "@types/vscode": "^1.79.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.2",
+    "@typescript-eslint/parser": "^6.13.2",
+    "@vscode/test-electron": "^2.3.8",
+    "@vscode/vsce": "^2.22.0",
+    "eslint": "^8.55.0",
+    "mocha": "^10.8.2",
+    "mocha-junit-reporter": "^2.2.0",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "@vscode/debugadapter": "1.64.0",
+    "@vscode/debugprotocol": "1.64.0"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "aurix-tcf.openDebugConfig",
+        "title": "Open Debug Configuration",
+        "category": "AURIX™ TCF"
+      },
+      {
+        "command": "aurix-tcf.pickSvd",
+        "title": "Pick SVD File",
+        "category": "AURIX™ TCF"
+      },
+      {
+        "command": "aurix-tcf.resetTarget",
+        "title": "Reset",
+        "category": "AURIX™ TCF",
+        "icon": {
+          "light": "media/reset-halt-light.svg",
+          "dark": "media/reset-halt-dark.svg"
+        }
+      },
+      {
+        "command": "aurix-tcf.toggleInstructionStepping",
+        "title": "Toggle Instruction Stepping",
+        "category": "AURIX™ TCF"
+      },
+      {
+        "command": "aurix-tcf.enableInstructionStepping",
+        "title": "Enable Instruction Stepping",
+        "category": "AURIX™ TCF",
+        "icon": {
+          "light": "media/instr-step-on-light.svg",
+          "dark": "media/instr-step-on-dark.svg"
+        }
+      },
+      {
+        "command": "aurix-tcf.disableInstructionStepping",
+        "title": "Disable Instruction Stepping",
+        "category": "AURIX™ TCF",
+        "icon": {
+          "light": "media/instr-step-off-light.svg",
+          "dark": "media/instr-step-off-dark.svg"
+        }
+      },
+      {
+        "command": "aurix-tcf.toggleLiveWatch",
+        "title": "Toggle Live Watch",
+        "category": "AURIX™ TCF"
+      },
+      {
+        "command": "aurix-tcf.configureLiveWatch",
+        "title": "Configure Live Watch",
+        "category": "AURIX™ TCF",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "aurix-tcf.liveWatchAddExpression",
+        "title": "Add Live Watch Expression",
+        "category": "AURIX™ TCF",
+        "icon": "$(add)"
+      },
+      {
+        "command": "aurix-tcf.liveWatchRemoveExpression",
+        "title": "Remove Live Watch Expression",
+        "category": "AURIX™ TCF",
+        "icon": "$(close)"
+      },
+      {
+        "command": "aurix-tcf.liveWatchClearExpressions",
+        "title": "Clear Live Watch Expressions",
+        "category": "AURIX™ TCF",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "aurix-tcf.liveWatchRefresh",
+        "title": "Refresh Live Watch",
+        "category": "AURIX™ TCF",
+        "icon": "$(refresh)"
+      }
+    ],
+    "views": {
+      "debug": [
+        {
+          "id": "aurixTcfLiveWatch",
+          "name": "Live Watch",
+          "icon": "media/debugger-icon.png",
+          "when": "debugType == aurix-tcf"
+        }
+      ]
+    },
+    "menus": {
+      "debug/toolBar": [
+        {
+          "command": "aurix-tcf.resetTarget",
+          "when": "debugType == aurix-tcf",
+          "group": "navigation"
+        },
+        {
+          "command": "aurix-tcf.enableInstructionStepping",
+          "when": "debugType == aurix-tcf && !aurix-tcf.instructionStepping",
+          "group": "navigation"
+        },
+        {
+          "command": "aurix-tcf.disableInstructionStepping",
+          "when": "debugType == aurix-tcf && aurix-tcf.instructionStepping",
+          "group": "navigation"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "aurix-tcf.liveWatchAddExpression",
+          "when": "view == aurixTcfLiveWatch",
+          "group": "navigation"
+        },
+        {
+          "command": "aurix-tcf.liveWatchRefresh",
+          "when": "view == aurixTcfLiveWatch",
+          "group": "navigation"
+        },
+        {
+          "command": "aurix-tcf.configureLiveWatch",
+          "when": "view == aurixTcfLiveWatch",
+          "group": "navigation"
+        },
+        {
+          "command": "aurix-tcf.liveWatchClearExpressions",
+          "when": "view == aurixTcfLiveWatch",
+          "group": "navigation@9"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "aurix-tcf.liveWatchRemoveExpression",
+          "when": "view == aurixTcfLiveWatch && viewItem == aurixTcfLiveWatchExpression",
+          "group": "inline"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "AURIX™ TCF Debugger",
+      "properties": {
+        "aurix-tcf.executePathMapper": {
+          "type": "boolean",
+          "default": true,
+          "description": "Execute path mapper function, if defined in launch configuration."
+        },
+        "aurix-tcf.agentPath": {
+          "type": "string",
+          "description": "Path to the TCF agent executable. If not specified, assumes agent is already running."
+        },
+        "aurix-tcf.autoStartAgent": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically start the TCF agent when debugging session starts."
+        },
+        "aurix-tcf.autoOpenDisassemblyView": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically open the VS Code Disassembly view when an AURIX TCF debug session starts."
+        },
+        "aurix-tcf.autoLockDisassemblyView": {
+          "type": "boolean",
+          "default": true,
+          "description": "Lock the Disassembly view editor group after opening it."
+        },
+        "aurix-tcf.autoEvenEditorWidths": {
+          "type": "boolean",
+          "default": true,
+          "description": "Evenly size editor groups after opening the Disassembly view."
+        },
+        "aurix-tcf.instructionSteppingDefault": {
+          "type": "boolean",
+          "default": false,
+          "description": "Default state for instruction-level stepping when a debug session starts."
+        },
+        "aurix-tcf.liveWatch.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Periodically refresh running global watch expressions. Local/frame-dependent watch expressions remain unchanged until the target stops."
+        },
+        "aurix-tcf.liveWatch.intervalMs": {
+          "type": "number",
+          "default": 1000,
+          "minimum": 200,
+          "description": "Refresh interval in milliseconds for running global watch expressions. Minimum 200ms+ is recommended and enforced."
+        }
+      }
+    },
+    "breakpoints": [
+      {
+        "language": "c"
+      },
+      {
+        "language": "cpp"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "aurix-tcf",
+        "label": "AURIX™ TCF Debugger",
+        "configurationAttributes": {
+          "launch": {
+            "required": [],
+            "properties": {
+              "program": {
+                "description": "Path to the ELF executable to debug",
+                "type": "string"
+              },
+              "workspace": {
+                "description": "Workspace or project path",
+                "type": "string"
+              },
+              "enableFlashing": {
+                "description": "If true, runs the bundled aurixflasher.exe with -elf <program> before starting the debug session",
+                "type": "boolean",
+                "default": false
+              },
+              "targetDevice": {
+                "description": "Target device name (must match lsmcdd.exe output; numeric ids are not supported). Used for agent -p and to resolve aurixflasher -id when enableFlashing is true.",
+                "type": "string"
+              },
+              "entryFunction": {
+                "description": "Entry function name (e.g., core0_main)",
+                "type": "string"
+              },
+              "svdFile": {
+                "description": "Path to SVD (System View Description) file for register definitions. Supports ${command:aurix-tcf.pickSvd}.",
+                "type": "string"
+              },
+              "ppuElfPath": {
+                "description": "Path to the PPU ELF executable",
+                "type": "string"
+              },
+              "cdspElfPaths": {
+                "description": "List of CDSP ELF executables (12 cores)",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "scrElfPath": {
+                "description": "Path to the SCR ELF executable",
+                "type": "string"
+              },
+              "additionalAgentOptions": {
+                "description": "Additional agent command-line options (appended as-is; default empty)",
+                "type": "string",
+                "default": ""
+              },
+              "liveWatchEnabled": {
+                "description": "Refresh running global watch expressions during execution.",
+                "type": "boolean",
+                "default": true
+              },
+              "liveWatchIntervalMs": {
+                "description": "Refresh interval in milliseconds for running global watch expressions. Minimum 200ms+ is recommended and enforced.",
+                "type": "number",
+                "default": 1000,
+                "minimum": 200
+              },
+              "enableConsoleLog": {
+                "description": "Show TCF protocol messages in the debug console",
+                "type": "boolean",
+                "default": false
+              }
+            }
+          }
+        },
+        "configurationSnippets": [
+          {
+            "label": "AURIX™ TCF: Launch",
+            "description": "Launch an AURIX™ program with TCF debugger",
+            "body": {
+              "type": "aurix-tcf",
+              "request": "launch",
+              "name": "Debug AURIX™ Program",
+              "workspace": "^\"\\${workspaceFolder}\"",
+              "program": "^\"\\${workspaceFolder}/build/program.elf\"",
+              "enableFlashing": false,
+              "liveWatchEnabled": true,
+              "liveWatchIntervalMs": 1000,
+              "enableConsoleLog": false
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

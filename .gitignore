@@ -1,0 +1,13 @@
+node_modules
+out
+.vscode
+*.map
+*.vsix
+docs/
+README_DEV.md
+.vscode-test
+# Local stress test env (do not commit)
+.env.test
+test-results/
+# Runtime log produced by the agent
+bin/AGENT_LOG.TXT
