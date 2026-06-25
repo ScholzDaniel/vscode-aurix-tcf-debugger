@@ -1889,15 +1889,6 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 			return;
 		}
 
-		// Don't issue StackTrace commands to the agent while the core is running.
-		// The agent blocks until the core suspends, which can exceed the command timeout.
-		// Return an empty stack; DAP will re-request when a StoppedEvent fires.
-		if (!this.suspendedContextIds.has(contextId)) {
-			response.body = { stackFrames: [], totalFrames: 0 };
-			this.sendResponse(response);
-			return;
-		}
-
 		const stack = this.trimPostResetStack(await this.tcfClient.getStackTrace(contextId, NEVER_CANCELLED, this.stackTraceDepth));
 		const frames: StackFrame[] = [];
 		for (const frame of stack) {
