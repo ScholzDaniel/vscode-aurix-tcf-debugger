@@ -49,6 +49,10 @@ import { SetMemoryMapCommand } from './tcf/memorymap';
 import { DisassembleDisassemblyCommand, GetCapabilitiesDisassemblyCommand } from './tcf/disassembly';
 import { GetMemoryCommand, MemoryErrorAddress, SetMemoryCommand } from './tcf/memory';
 import { TCFCodeAreaLineNumbers } from './tcf/linenumbers';
+import { GetStatusBreakpointsCommand } from './tcf/breakpoints';
+import { isStepOutReturnStop, StepOutTarget } from './stepOutStop';
+import { disassemblyWindow } from './disassemblyWindow';
+import { BreakpointStopBarrier } from './breakpointStopBarrier';
 
 export interface InternalLaunchArguments {
 	debugTCFMessages?: boolean;
@@ -310,8 +314,25 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 
 	private tcfLogger: DebugLogger;
 	private tcfClient: TCFClient;
+	private readonly breakpointStops = new BreakpointStopBarrier(
+		async () => (await this.tcfClient.getThreads(true)).map(thread => ({
+			id: thread.info.ID, suspended: thread.state.suspended
+		})),
+		(contextId, allThreadsStopped, refocus) => {
+			const threadId = this.getOrAssignThreadId(contextId);
+			this.cancelPendingPauseStoppedTimers('verifiedBreakpoint');
+			this.suppressPauseStoppedUntilMs = Date.now() + Math.max(150, this.stopStormPauseDelayMs * 4);
+			if (!refocus) {
+				this.notePrimaryBreakpointStop(threadId, contextId);
+			}
+			this.sendStoppedEvent(StoppedEventReason.breakpoint, threadId, { allThreadsStopped });
+		},
+		message => this.sendEvent(new OutputEvent(`${message}\n`, 'stderr'))
+	);
 	private suspendedContextIds = new Set<string>();
 	private pendingStepThreads = new Set<number>();
+	private pendingStepOutTargets = new Map<number, StepOutTarget & { breakpointRevision: number }>();
+	private breakpointRevision = 0;
 	private configuredGlobals: string[] = [];
 	private liveWatchEnabled = false;
 	private liveWatchIntervalMs = 1000;
@@ -333,7 +354,9 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 	private primaryBreakpointStop:
 		| { threadId: number; ctx: string; untilMs: number; refocused: boolean; stackSuppressUntilMs: number }
 		| undefined;
-	private frameIdToMeta = new Map<number, { threadId: number; ctx: string; stack?: string }>();
+	private frameIdToMeta = new Map<number, {
+		threadId: number; ctx: string; stack?: string; source?: { path: string; line: number }
+	}>();
 	private threadIdToFrameIds = new Map<number, Set<number>>();
 	private liveWatchSuspendFallbackBlockedUntilMs: number = 0;
 	private postResetStackTrimUntilMs: number = 0;
@@ -374,6 +397,7 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 				outer.onContextResumed(contextID);
 			}
 			protected onSocketError(err: any) {
+				outer.cancelBreakpointStops('socketError');
 				outer.tcfLogger.error(`TCF socket error: ${String(err)}`);
 				outer.sendEvent(new TerminatedEvent());
 			}
@@ -427,7 +451,7 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 		// Used for pauseOnEntry and reset+halt scenarios.
 		try {
 			for (let attempt = 0; attempt < 2; attempt++) {
-				const infos = await this.tcfClient.getThreads();
+				const infos = await this.tcfClient.getThreads(true);
 				const running = infos.filter(t => !t.state?.suspended).map(t => t.info.ID);
 				const suspended = infos.filter(t => Boolean(t.state?.suspended)).map(t => t.info.ID);
 				this.startupLog(
@@ -441,8 +465,8 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 				for (const id of running) {
 					try {
 						await this.tcfClient.pause(id);
-					} catch {
-						// Best-effort: tolerate agent quirks/timeouts for individual cores.
+					} catch (error) {
+						this.tcfLogger.error(`Failed to pause ${id} (${tag}): ${String(error)}`);
 					}
 				}
 
@@ -454,10 +478,10 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 		}
 	}
 
-	private sendStoppedEvent(
+	protected sendStoppedEvent(
 		reason: string,
 		threadId: number,
-		opts?: { allThreadsStopped?: boolean; preserveFocus?: boolean }
+		opts?: { allThreadsStopped?: boolean; preserveFocusHint?: boolean }
 	) {
 		const ctx = this.threadIdToContext.get(threadId);
 		this.focusLog(
@@ -468,13 +492,11 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 				`[dap] StoppedEvent reason=${reason} threadId=${threadId} ctx=${String(ctx ?? '')} allThreadsStopped=${String(Boolean(opts?.allThreadsStopped))}`
 			);
 		}
-		const ev = new StoppedEvent(reason, threadId);
+		const ev: DebugProtocol.StoppedEvent = new StoppedEvent(reason, threadId);
 		if (opts?.allThreadsStopped) {
-			(ev.body as any).allThreadsStopped = true;
+			ev.body.allThreadsStopped = true;
 		}
-		if (opts?.preserveFocus !== undefined) {
-			(ev.body as any).preserveFocus = opts.preserveFocus;
-		}
+		ev.body.preserveFocusHint = opts?.preserveFocusHint ?? false;
 		this.sendEvent(ev);
 	}
 
@@ -497,6 +519,19 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 		clearTimeout(timer);
 		this.pendingBreakpointStoppedTimers.delete(contextId);
 		this.focusLog(`cancelPendingBreakpointStoppedTimer(${contextId}, ${tag})`);
+	}
+
+	private cancelBreakpointStops(tag: string): void {
+		this.breakpointStops.invalidate();
+		this.primaryBreakpointStop = undefined;
+		for (const contextId of Array.from(this.pendingBreakpointStoppedTimers.keys())) {
+			this.cancelPendingBreakpointStoppedTimer(contextId, tag);
+		}
+	}
+
+	private notifyBreakpointStopped(contextId: string, refocus = false): void {
+		const contexts = Object.values(this.tcfClient.contextInfo).filter(info => info.HasState).map(info => info.ID);
+		void this.breakpointStops.notify(contextId, contexts, refocus);
 	}
 
 	private notePrimaryBreakpointStop(threadId: number, ctx: string) {
@@ -534,7 +569,7 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 		this.tcfLogger.log(
 			`[dap] Refocus: from=${from} requestedThreadId=${requested.threadId} requestedCtx=${requested.ctx} -> breakpointThreadId=${p.threadId} breakpointCtx=${p.ctx}`
 		);
-		this.sendStoppedEvent(StoppedEventReason.breakpoint, p.threadId, { allThreadsStopped: true });
+		this.notifyBreakpointStopped(p.ctx, true);
 	}
 
 	private tryResolveFrame(frameId: number): { threadId?: number; ctx?: string; stack?: string } {
@@ -552,8 +587,8 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 		}
 	}
 
-	private rememberFrameMeta(frameId: number, threadId: number, ctx: string, stack?: string) {
-		this.frameIdToMeta.set(frameId, { threadId, ctx, stack });
+	protected rememberFrameMeta(frameId: number, threadId: number, ctx: string, stack?: string, source?: { path: string; line: number }) {
+		this.frameIdToMeta.set(frameId, { threadId, ctx, stack, source });
 		let set = this.threadIdToFrameIds.get(threadId);
 		if (!set) {
 			set = new Set<number>();
@@ -580,15 +615,15 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 	}
 
 	private beginResetTransition(): void {
+		this.cancelBreakpointStops('reset');
+		this.pendingStepThreads.clear();
+		this.pendingStepOutTargets.clear();
 		const now = Date.now();
 		this.liveWatchSuspendFallbackBlockedUntilMs = now + 1500;
 		this.postResetStackTrimUntilMs = now + 2000;
 		this.primaryBreakpointStop = undefined;
 		this.suppressPauseStoppedUntilMs = 0;
 		this.cancelPendingPauseStoppedTimers('reset');
-		for (const contextId of Array.from(this.pendingBreakpointStoppedTimers.keys())) {
-			this.cancelPendingBreakpointStoppedTimer(contextId, 'reset');
-		}
 		this.clearAllFrameMeta();
 	}
 
@@ -1028,41 +1063,6 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 		this.startupLog(`emitStoppedIfSuspended(${contextId}, reason=${reason}): emitted StoppedEvent(threadId=${threadId})`);
 	}
 
-	private async emitSourceLocation(contextId: string): Promise<void> {
-		try {
-			const findMapped = (frames: Array<{ mapToSource?: TCFCodeAreaLineNumbers }>): TCFCodeAreaLineNumbers | undefined => {
-				for (const frame of frames) {
-					if (frame?.mapToSource?.File && frame.mapToSource.SLine) {
-						return frame.mapToSource;
-					}
-				}
-				return undefined;
-			};
-
-			// Fast path: only query the top frame first.
-			let stack = await this.tcfClient.getStackTrace(contextId, NEVER_CANCELLED, 1);
-			let mapped = findMapped(stack);
-
-			// Fallback: if top frame has no mapping, query full stack.
-			if (!mapped) {
-				stack = await this.tcfClient.getStackTrace(contextId, NEVER_CANCELLED, -1);
-				mapped = findMapped(stack);
-			}
-			if (!mapped?.File || !mapped.SLine) {
-				return;
-			}
-			const sourcePath = this.resolveMappedSourcePath(mapped);
-			if (!sourcePath) {
-				return;
-			}
-			this.sendEvent(new Event('aurix-tcf/sourceLocation', { path: sourcePath, line: mapped.SLine }));
-		} catch (e) {
-			if (this.startupDiagnosticsEnabled) {
-				this.tcfLogger.log(`[source] failed to resolve source location for ${contextId}: ${String(e)}`);
-			}
-		}
-	}
-
 	private async emitStoppedForAllSuspendedAtStartup(
 		// The targetContextId is the one the user requested to stop on (if any).
 		// We prefer to emit the stopped event for that core if it's suspended,
@@ -1072,7 +1072,11 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 		opts?: { targetReason?: StoppedEventReason; otherReason?: StoppedEventReason }
 	): Promise<void> {
 		try {
-			const infos = await this.tcfClient.getThreads();
+			const version = this.breakpointStops.version;
+			const infos = await this.tcfClient.getThreads(true);
+			if (version !== this.breakpointStops.version) {
+				return;
+			}
 			const suspended = infos.filter(t => Boolean(t.state?.suspended)).map(t => t.info.ID);
 			this.startupLog(`emitStoppedForAllSuspendedAtStartup: suspended=${suspended.length ? suspended.join(', ') : '(none)'}`);
 			const targetReason = opts?.targetReason ?? StoppedEventReason.entry;
@@ -1084,16 +1088,20 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 				this.onThreadSuspended(threadId);
 			}
 
-			// DAP: Emit a single stopped event with allThreadsStopped=true. This keeps the UI stable and
-			// prevents VS Code from opening sources for other cores during startup.
+			// Keep startup focus on one core without claiming that running siblings are stopped.
 			let focusCtx = targetContextId;
 			if (!focusCtx || !suspended.includes(focusCtx)) {
 				focusCtx = suspended.length > 0 ? suspended[0] : undefined;
 			}
 			if (focusCtx) {
 				const threadId = this.getOrAssignThreadId(focusCtx);
-				this.sendStoppedEvent(targetReason, threadId, { allThreadsStopped: true, preserveFocus: false });
-				this.startupLog(`emitStoppedForAllSuspendedAtStartup: emitted ${targetReason} for ${focusCtx} (threadId=${threadId}) allThreadsStopped=true`);
+				if (targetReason === StoppedEventReason.breakpoint) {
+					this.notifyBreakpointStopped(focusCtx);
+				} else {
+					const allThreadsStopped = infos.length > 0 && infos.every(thread => thread.state.suspended);
+					this.sendStoppedEvent(targetReason, threadId, { allThreadsStopped, preserveFocusHint: false });
+					this.startupLog(`emitStoppedForAllSuspendedAtStartup: emitted ${targetReason} for ${focusCtx} (threadId=${threadId}) allThreadsStopped=${allThreadsStopped}`);
+				}
 			}
 		} catch (e) {
 			this.startupLog(`emitStoppedForAllSuspendedAtStartup: failed: ${String(e)}`);
@@ -1480,7 +1488,7 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 		}
 	}
 
-	protected override async disassembleRequestAsync(response: any, args: any): Promise<void> {
+	protected override async disassembleRequestAsync(response: DebugProtocol.DisassembleResponse, args: DebugProtocol.DisassembleArguments): Promise<void> {
 		// 1) Parse memoryReference + offset from DAP request and compute start address.
 		//    (typically around the current PC reported by stackTrace)
 		// 2) Pick a suitable context ID (core) to issue the disassemble command to.
@@ -1490,52 +1498,42 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 		try {
 			const memoryReference = typeof args?.memoryReference === 'string' ? args.memoryReference.trim() : '';
 			if (memoryReference === '') {
-				response.body = { instructions: [] };
-				this.sendResponse(response);
-				return;
+				throw new Error('Missing memoryReference');
 			}
 
-			const parseAddr = (ref: string): number | undefined => {
-				const s = ref.trim();
-				if (s === '') {
-					return undefined;
-				}
-				if (/^0x[0-9a-f]+$/i.test(s)) {
-					const n = Number.parseInt(s.substring(2), 16);
-					return Number.isFinite(n) ? n : undefined;
-				}
-				if (/^[0-9]+$/.test(s)) {
-					const n = Number.parseInt(s, 10);
-					return Number.isFinite(n) ? n : undefined;
-				}
-				const n = Number(s);
-				return Number.isFinite(n) ? n : undefined;
-			};
-
-			const base = parseAddr(memoryReference);
-			if (base === undefined) {
-				response.body = { instructions: [] };
-				this.sendResponse(response);
-				return;
+			const base = this.parseMemoryReference(memoryReference);
+			if (base === undefined || !Number.isSafeInteger(base) || base < 0) {
+				throw new Error('Invalid memoryReference');
 			}
 
-			const offset = typeof args?.offset === 'number' && Number.isFinite(args.offset) ? args.offset : 0;
-			const instructionOffset = typeof args?.instructionOffset === 'number' && Number.isFinite(args.instructionOffset)
-				? args.instructionOffset
-				: 0;
-			const instructionCount = typeof args?.instructionCount === 'number' && args.instructionCount > 0 ? args.instructionCount : 32;
+			const offset = args.offset ?? 0;
+			const instructionOffset = args.instructionOffset ?? 0;
+			const instructionCount = args.instructionCount;
+			if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(instructionOffset) ||
+				!Number.isSafeInteger(instructionCount) || instructionCount < 0) {
+				throw new Error('Invalid disassembly count or offset');
+			}
 			const baseAddress = base + offset;
+			if (!Number.isSafeInteger(baseAddress)) {
+				throw new Error('Disassembly address exceeds supported precision');
+			}
+			if (instructionCount === 0) {
+				response.body = { instructions: [] };
+				this.sendResponse(response);
+				return;
+			}
 			// TriCore instructions are 2 or 4 bytes. Use max size to ensure we cover the requested window.
 			const minInstrBytes = 2;
 			const maxInstrBytes = 4;
 			const alignedBaseAddress = baseAddress - (baseAddress % minInstrBytes);
 			let startAddress = alignedBaseAddress + (instructionOffset * maxInstrBytes);
+			if (!Number.isSafeInteger(startAddress)) {
+				throw new Error('Disassembly offset exceeds supported precision');
+			}
 
 			const ctx = (await this.pickContextIdForCore(this.launchCore)) ?? (await this.pickAnySuspendedContextId());
 			if (!ctx) {
-				response.body = { instructions: [] };
-				this.sendResponse(response);
-				return;
+				throw new Error('No context for disassembly');
 			}
 
 			if (this.disassemblyCapabilities === undefined) {
@@ -1544,7 +1542,8 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 					this.disassemblyCapabilities = (caps || [])
 						.map(c => (c?.ISA ? String(c.ISA) : ''))
 						.filter(x => x.trim() !== '');
-				} catch {
+				} catch (error) {
+					this.tcfLogger.error(`Cannot query disassembly capabilities: ${String(error)}`);
 					this.disassemblyCapabilities = [];
 				}
 			}
@@ -1562,7 +1561,7 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 			// Clip to executable ranges from the ELF (if available).
 			const execRange = this.findExecutableRangeForAddress(alignedBaseAddress);
 			if (this.execRanges.length > 0 && !execRange) {
-				response.body = { instructions: [] };
+				response.body = { instructions: disassemblyWindow([], alignedBaseAddress, instructionOffset, instructionCount) };
 				this.sendResponse(response);
 				return;
 			}
@@ -1576,79 +1575,28 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 				startAddress = startAddress - (startAddress % minInstrBytes);
 				byteBudget = Math.max(1, Math.min(byteBudget, execRange.end - startAddress));
 				if (byteBudget <= 0) {
-					response.body = { instructions: [] };
+					response.body = { instructions: disassemblyWindow([], alignedBaseAddress, instructionOffset, instructionCount) };
 					this.sendResponse(response);
 					return;
 				}
 			}
 			const disassembleAt = async (addr: number) => {
 				return await this.tcfClient.sendCommand(
-					new DisassembleDisassemblyCommand(ctx, addr, byteBudget, {
+					new DisassembleDisassemblyCommand(ctx, addr, execRange ? Math.min(byteBudget, execRange.end - addr) : byteBudget, {
 						ISA: 'TRICORE',
 						Simplified: true,
 						PseudoInstructions: true,
 						OpcodeValue: true,
-					} as any)
+					})
 				);
 			};
 			let lines = await disassembleAt(startAddress);
 
-			const toHexBytes = (opcodeValue: any): string | undefined => {
-				if (typeof opcodeValue !== 'string' || opcodeValue.trim() === '') {
-					return undefined;
-				}
-				try {
-					const buf = Buffer.from(opcodeValue, 'base64');
-					if (buf.length === 0) {
-						return undefined;
-					}
-					return Array.from(buf.values()).map(b => b.toString(16).padStart(2, '0')).join(' ');
-				} catch {
-					return undefined;
-				}
-			};
-
-			let list = Array.isArray(lines) ? lines : [];
-			let instructions = list.map((l: any) => {
-				const addr = typeof l?.Address === 'number' ? l.Address : startAddress;
-				const parts = Array.isArray(l?.Instruction) ? l.Instruction : [];
-				const text = parts.map((p: any) => (p?.Text ? String(p.Text) : '')).join('');
-				const bytes = toHexBytes(l?.OpcodeValue);
-				return {
-					address: `0x${addr.toString(16)}`,
-					instruction: text || '',
-					instructionBytes: bytes,
-				};
-			});
-
-			// Align the returned window to match instructionOffset semantics.
-			let baseIndex = instructions.findIndex((i) => parseAddr(i.address) === alignedBaseAddress);
-			if (baseIndex < 0) {
+			if (!lines?.some(line => line.Address === alignedBaseAddress)) {
 				// Retry disassembly anchored at the aligned base address.
 				lines = await disassembleAt(alignedBaseAddress);
-				list = Array.isArray(lines) ? lines : [];
-				instructions = list.map((l: any) => {
-					const addr = typeof l?.Address === 'number' ? l.Address : alignedBaseAddress;
-					const parts = Array.isArray(l?.Instruction) ? l.Instruction : [];
-					const text = parts.map((p: any) => (p?.Text ? String(p.Text) : '')).join('');
-					const bytes = toHexBytes(l?.OpcodeValue);
-					return {
-						address: `0x${addr.toString(16)}`,
-						instruction: text || '',
-						instructionBytes: bytes,
-					};
-				});
-				baseIndex = instructions.findIndex((i) => parseAddr(i.address) === alignedBaseAddress);
 			}
-			let startIndex = 0;
-			if (baseIndex >= 0) {
-				startIndex = baseIndex + instructionOffset;
-			}
-			if (startIndex < 0) {
-				startIndex = 0;
-			}
-
-			instructions = instructions.slice(startIndex, startIndex + instructionCount);
+			const instructions = disassemblyWindow(lines ?? [], alignedBaseAddress, instructionOffset, instructionCount);
 
 			response.body = { instructions };
 			this.sendResponse(response);
@@ -1837,6 +1785,10 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 	}
 
 	protected override async disconnectRequestAsync(response: DebugProtocol.DisconnectResponse): Promise<void> {
+		this.cancelBreakpointStops('disconnect');
+		this.cancelPendingPauseStoppedTimers('disconnect');
+		this.pendingStepThreads.clear();
+		this.pendingStepOutTargets.clear();
 		this.tcfClient.disconnect();
 		this.sendResponse(response);
 		this.sendEvent(new TerminatedEvent());
@@ -1893,7 +1845,6 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 		const frames: StackFrame[] = [];
 		for (const frame of stack) {
 			const frameId = this.createNextStackFrameId(args.threadId, frame.context);
-			this.rememberFrameMeta(frameId, args.threadId, contextId, frame.context?.ID);
 			const mapped = frame.mapToSource;
 			const ipNum = typeof frame.context?.IP === 'number' ? frame.context.IP : undefined;
 			// Align to instruction boundary (TriCore has 2/4-byte instructions).
@@ -1901,6 +1852,8 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 			const ipRef = ipAligned !== undefined ? `0x${ipAligned.toString(16)}` : undefined;
 			if (mapped?.File && mapped?.SLine) {
 				const sourcePath = this.resolveMappedSourcePath(mapped);
+				this.rememberFrameMeta(frameId, args.threadId, contextId, frame.context?.ID,
+					sourcePath ? { path: sourcePath, line: mapped.SLine } : undefined);
 				const src = sourcePath ? new Source(path.basename(sourcePath), sourcePath) : undefined;
 				const sf = new StackFrame(frameId, frame.context.Name || frame.context.ID, src, mapped.SLine, 1);
 				(sf as any).instructionPointerReference = ipRef;
@@ -1908,6 +1861,7 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 				continue;
 			}
 
+			this.rememberFrameMeta(frameId, args.threadId, contextId, frame.context?.ID);
 			const sf = new StackFrame(frameId, frame.context.Name || frame.context.ID);
 			(sf as any).instructionPointerReference = ipRef;
 			frames.push(sf);
@@ -2126,12 +2080,7 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 			const v = await this.tcfClient.getExpressionIDVariable(ctx, stack ?? createParentContext, exprId, expressionText);
 
 			if (!v) {
-				if (this.tryRespondWithCachedWatchValue(response, expressionText, isWatchRequest)) {
-					return;
-				}
-				response.body = { result: '', variablesReference: 0 };
-				this.sendResponse(response);
-				return;
+				throw new Error(`Cannot display expression '${expressionText}': unsupported value type`);
 			}
 
 			let variablesReference = 0;
@@ -2144,8 +2093,12 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 				// ignore child errors
 			}
 
+			const result = await v.displayValue();
+			if (result === undefined) {
+				throw new Error(`Cannot display expression '${expressionText}': value decoding failed`);
+			}
 			response.body = {
-				result: (await v.displayValue?.()) ?? '',
+				result,
 				variablesReference,
 			};
 			if (isWatchRequest) {
@@ -2277,12 +2230,17 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 
 
 	protected override async continueRequestAsync(response: DebugProtocol.ContinueResponse, args: DebugProtocol.ContinueArguments): Promise<void> {
+		this.cancelBreakpointStops('continue');
+		this.pendingStepThreads.delete(args.threadId);
+		this.pendingStepOutTargets.delete(args.threadId);
 		const contextId = this.threadIdToContext.get(args.threadId);
 		await this.tcfClient.continue(contextId);
 		this.sendResponse(response);
 	}
 
 	protected override async nextRequestAsync(response: DebugProtocol.NextResponse, args: DebugProtocol.NextArguments): Promise<void> {
+		this.cancelBreakpointStops('next');
+		this.pendingStepOutTargets.delete(args.threadId);
 		const contextId = this.threadIdToContext.get(args.threadId);
 		this.pendingStepThreads.add(args.threadId);
 		if (this.instructionSteppingEnabled) {
@@ -2393,29 +2351,70 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 	}
 
 	protected override async stepInRequestAsync(response: DebugProtocol.StepInResponse, args: DebugProtocol.StepInArguments): Promise<void> {
+		this.cancelBreakpointStops('stepIn');
+		this.pendingStepOutTargets.delete(args.threadId);
 		const contextId = this.threadIdToContext.get(args.threadId);
 		this.pendingStepThreads.add(args.threadId);
-		if (this.instructionSteppingEnabled) {
-			await this.tcfClient.nextInstruction(contextId);
-		} else {
-			await this.tcfClient.stepIn(contextId);
+		try {
+			if (this.instructionSteppingEnabled) {
+				await this.tcfClient.stepInInstruction(contextId);
+			} else {
+				await this.tcfClient.stepIn(contextId);
+			}
+		} catch (error) {
+			this.pendingStepThreads.delete(args.threadId);
+			throw error;
 		}
 		this.sendResponse(response);
 	}
 
 	protected override async stepOutRequestAsync(response: DebugProtocol.StepOutResponse, args: DebugProtocol.StepOutArguments): Promise<void> {
+		this.cancelBreakpointStops('stepOut');
 		const contextId = this.threadIdToContext.get(args.threadId);
+		if (!contextId) {
+			throw new Error(`Cannot step out: unknown thread ${args.threadId}`);
+		}
+		this.pendingStepThreads.delete(args.threadId);
+		this.pendingStepOutTargets.delete(args.threadId);
+		const stack = await this.tcfClient.getStackTrace(contextId, NEVER_CANCELLED);
+		const returnAddress = stack[1]?.context.IP;
+		if (typeof returnAddress === 'number' && Number.isSafeInteger(returnAddress) && returnAddress >= 0) {
+			const breakpointRevision = this.breakpointRevision;
+			const breakpoints = [...this.breakpointsManager.getAll(), ...this.instructionBreakpointsManager.getAll()];
+			try {
+				const breakpointStatuses = await Promise.all(breakpoints.map(breakpoint =>
+					this.tcfClient.sendCommand(new GetStatusBreakpointsCommand(this.breakpointIdToTcfId(breakpoint.id)))));
+				this.pendingStepOutTargets.set(args.threadId, { returnAddress, breakpointStatuses, breakpointRevision });
+			} catch (error) {
+				this.tcfLogger.error(`Cannot verify Step Out user breakpoints; preserving agent stop reason: ${String(error)}`);
+			}
+		} else {
+			this.tcfLogger.log('Step Out caller address unavailable; preserving agent stop reason.');
+		}
 		this.pendingStepThreads.add(args.threadId);
 		// No instruction-level "step out" in TCF; keep semantic step-out.
-		await this.tcfClient.stepOut(contextId);
+		try {
+			await this.tcfClient.stepOut(contextId);
+		} catch (error) {
+			this.pendingStepThreads.delete(args.threadId);
+			this.pendingStepOutTargets.delete(args.threadId);
+			throw error;
+		}
 		this.sendResponse(response);
 	}
 
 	protected override async pauseRequestAsync(response: DebugProtocol.PauseResponse, args: DebugProtocol.PauseArguments): Promise<void> {
+		this.pendingStepThreads.clear();
+		this.pendingStepOutTargets.clear();
 		const contextId = this.threadIdToContext.get(args.threadId);
 		// Even when VS Code sends Pause for a specific thread, users expect "pause" to stop the whole
 		// multi-core system. Explicitly suspend all core contexts and then emit stopped events.
 		await this.pauseAllCoresBestEffort('pauseRequestAsync');
+		const threads = await this.tcfClient.getThreads(true);
+		const running = threads.filter(thread => !thread.state.suspended);
+		if (threads.length === 0 || running.length > 0) {
+			throw new Error(`Pause did not halt all cores: ${running.map(thread => thread.info.ID).join(', ') || 'no execution contexts'}`);
+		}
 		await this.emitStoppedForAllSuspendedAtStartup(contextId, { targetReason: StoppedEventReason.pause, otherReason: StoppedEventReason.pause });
 		this.sendResponse(response);
 	}
@@ -2509,6 +2508,7 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 	}
 
 	private async syncAllBreakpoints(): Promise<void> {
+		this.breakpointRevision++;
 		const all = this.breakpointsManager.getAll();
 		const data: BreakpointData[] = all.map(b => ({
 			ID: this.breakpointIdToTcfId(b.id),
@@ -2589,7 +2589,7 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 		}
 
 		const contextId = contexts[0];
-		if (this.pendingBreakpointStoppedTimers.has(contextId)) {
+		if (this.pendingBreakpointStoppedTimers.has(contextId) || this.breakpointStops.has(contextId)) {
 			return;
 		}
 		this.cancelPendingPauseStoppedTimers('breakpointHit');
@@ -2598,15 +2598,16 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 		const timer = setTimeout(() => {
 			this.pendingBreakpointStoppedTimers.delete(contextId);
 			const threadId = this.getOrAssignThreadId(contextId);
+			this.pendingStepThreads.delete(threadId);
+			this.pendingStepOutTargets.delete(threadId);
 			this.onThreadSuspended(threadId);
-			this.notePrimaryBreakpointStop(threadId, contextId);
-			this.sendStoppedEvent(StoppedEventReason.breakpoint, threadId, { allThreadsStopped: true });
-			void this.emitSourceLocation(contextId);
+			this.notifyBreakpointStopped(contextId);
 		}, this.breakpointStopDelayMs);
 		this.pendingBreakpointStoppedTimers.set(contextId, timer);
 	}
 
 	private onBreakpointRemoved(tcfIds: string[]) {
+		this.breakpointRevision++;
 		for (const tcfId of tcfIds) {
 			const id = this.breakpointTcfIdToId(tcfId);
 			if (id === BREAKPOINT_INVALID) {
@@ -2624,13 +2625,14 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 			if (id === BREAKPOINT_INVALID) {
 				continue;
 			}
+			this.breakpointRevision++;
 			this.breakpointsManager.setVerified(id, true);
 			this.instructionBreakpointsManager.setVerified(id, true);
 			this.sendEvent(new BreakpointEvent(BreakpointEventReason.changed, { id, verified: true }));
 		}
 	}
 
-	private onContextSuspended(info: ContextSuspendedData) {
+	protected onContextSuspended(info: ContextSuspendedData) {
 		// Ignore duplicate suspend events for the same context.
 		const contextId = info.id;
 		if (this.suspendedContextIds.has(contextId)) {
@@ -2642,7 +2644,18 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 
 		const reasonText = (info.reason || '').toLowerCase();
 		const pendingStep = this.pendingStepThreads.delete(threadId);
+		const stepOutTarget = this.pendingStepOutTargets.get(threadId);
+		this.pendingStepOutTargets.delete(threadId);
 		let reason = reasonText.includes('breakpoint') ? StoppedEventReason.breakpoint : StoppedEventReason.pause;
+		if (reason === StoppedEventReason.breakpoint && pendingStep &&
+			stepOutTarget?.breakpointRevision === this.breakpointRevision &&
+			!this.pendingBreakpointStoppedTimers.has(contextId) &&
+			isStepOutReturnStop(info, stepOutTarget)) {
+			reason = StoppedEventReason.step;
+		}
+		if (stepOutTarget && reasonText.includes('breakpoint')) {
+			this.tcfLogger.log(`[stepOut] return=0x${stepOutTarget.returnAddress.toString(16)} pc=0x${info.pc.toString(16)} mappedReason=${reason}; user breakpoint evidence takes precedence`);
+		}
 		if (reason !== StoppedEventReason.breakpoint) {
 			if (pendingStep || reasonText.includes('step')) {
 				reason = StoppedEventReason.step;
@@ -2703,9 +2716,7 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 			this.refreshLiveWatchTimer();
 			this.cancelPendingPauseStoppedTimers('runcontrolBreakpoint');
 			this.suppressPauseStoppedUntilMs = Date.now() + Math.max(150, this.stopStormPauseDelayMs * 4);
-			this.notePrimaryBreakpointStop(threadId, contextId);
-			this.sendStoppedEvent(reason, threadId, { allThreadsStopped: true });
-			void this.emitSourceLocation(contextId);
+			this.notifyBreakpointStopped(contextId);
 			return;
 		}
 
@@ -2713,13 +2724,12 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 		if (reason === StoppedEventReason.step) {
 			this.refreshLiveWatchTimer();
 			this.sendStoppedEvent(reason, threadId);
-			void this.emitSourceLocation(contextId);
 			return;
 		}
 
 		// Delay pause-type stops slightly. This helps ensure a breakpoint stop becomes the primary
 		// UI context when multiple cores suspend nearly simultaneously.
-		if (Date.now() < this.suppressPauseStoppedUntilMs) {
+		if (this.breakpointStops.waiting || Date.now() < this.suppressPauseStoppedUntilMs) {
 			this.focusLog(`suppress pause StoppedEvent for ${contextId} (threadId=${threadId})`);
 			return;
 		}
@@ -2732,22 +2742,21 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 				if (!this.suspendedContextIds.has(contextId)) {
 					return;
 				}
-				if (Date.now() < this.suppressPauseStoppedUntilMs) {
+				if (this.breakpointStops.waiting || Date.now() < this.suppressPauseStoppedUntilMs) {
 					return;
 				}
-				this.sendStoppedEvent(StoppedEventReason.pause, threadId);
-				void this.emitSourceLocation(contextId);
+				this.sendStoppedEvent(StoppedEventReason.pause, threadId, { preserveFocusHint: true });
 			}, this.stopStormPauseDelayMs);
 			this.pendingPauseStoppedTimers.set(contextId, timer);
 			return;
 		}
 
-		this.sendStoppedEvent(reason, threadId);
+		this.sendStoppedEvent(reason, threadId, { preserveFocusHint: true });
 		this.refreshLiveWatchTimer();
-		void this.emitSourceLocation(contextId);
 	}
 
 	private onContextResumed(contextId: string) {
+		this.cancelBreakpointStops('contextResumed');
 		this.suspendedContextIds.delete(contextId);
 		const threadId = this.getOrAssignThreadId(contextId);
 		this.onThreadResumed(threadId);
@@ -2763,12 +2772,26 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 	}
 
 	protected override async customRequestAsync(command: string, response: DebugProtocol.Response, args: any, request?: DebugProtocol.Request): Promise<void> {
+		if (command === 'aurix-tcf/frameSource') {
+			if (!Number.isInteger(args?.frameId) || !Number.isInteger(args?.threadId)) {
+				throw new Error('frameSource requires integer frameId and threadId');
+			}
+			const frame = this.frameIdToMeta.get(args.frameId);
+			if (!frame || frame.threadId !== args.threadId) {
+				throw new Error('frameSource refers to an expired frame or a different core');
+			}
+			response.body = { source: frame.source };
+			this.sendResponse(response);
+			return;
+		}
 		if (command === 'aurix-tcf/setInstructionStepping') {
 			this.instructionSteppingEnabled = Boolean(args?.enabled);
 			this.sendResponse(response);
 			return;
 		}
 		if (command === 'aurix-tcf/halt') {
+			this.pendingStepThreads.clear();
+			this.pendingStepOutTargets.clear();
 			try {
 				// Best-effort: suspend the selected core context first (faster than trying many contexts).
 				const ctx = await this.pickContextIdForCore(this.launchCore);

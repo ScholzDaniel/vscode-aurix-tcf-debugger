@@ -3,7 +3,7 @@ Copyright (C) 2022, 2023 Intel Corporation
 SPDX-License-Identifier: MIT
 */
 import { TCFError } from './error';
-import { TCFSymbolClass } from './symbols';
+import { TCFTypeClass } from './symbols';
 import { asNullable, asString, asStringArray, handleError, handleErrorBuffer, PromiseError, PromiseSuccess, responseLengthAbout, SimpleCommand, TCFPartialResultError, toBuffer, validateJSON, ValidatingCommand } from './tcfutils';
 import * as validateValueProperties from './validators/validate-ValueProperties';
 import * as validateExpressionsContextData from './validators/validate-ExpressionsContextData';
@@ -79,7 +79,7 @@ export interface PieceValue {
 }
 
 export interface ValueProperties {
-    Class?: TCFSymbolClass,
+    Class?: TCFTypeClass,
     Type?: string,
     Symbol?: string,
     BitStride?: number,

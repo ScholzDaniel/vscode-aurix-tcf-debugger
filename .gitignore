@@ -8,6 +8,15 @@ README_DEV.md
 .vscode-test
 # Local stress test env (do not commit)
 .env.test
+*.local.json
 test-results/
+/ACS_TEST_MAP.md
+/TESTING.md
+/scripts/export-acs-map.ps1
+/scripts/run-breakpoint-test.ps1
+/scripts/run-test.ps1
+/scripts/tc375.example.json
+/scripts/test-tc375.ps1
 # Runtime log produced by the agent
 bin/AGENT_LOG.TXT
+/bin/aurixflasher/

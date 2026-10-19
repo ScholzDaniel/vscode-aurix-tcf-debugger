@@ -12,7 +12,7 @@ import { EvaluateExpressionsCommand, EvaluateResult, GetChildrenExpressionComman
 import { MapToSourceLineNumbersCommand, TCFCodeAreaLineNumbers } from "./tcf/linenumbers";
 import { asNullableTCFContextData, asTCFContextData, ContextSuspendedData, GetChildrenRunControlCommand, GetContextRunControlCommand, GetStateRunControlCommand, parseContextSuspended, TCFContextData, TCFStateData } from "./tcf/runcontrol";
 import { GetChildrenRangeStackTraceCommand, GetChildrenStackTraceCommand, GetContextStackTraceCommand, TCFContextDataStackTrace } from "./tcf/stacktrace";
-import { FindByAddrSymbolsCommand, GetContextSymbolsCommand, TCFTypeClass } from "./tcf/symbols";
+import { FindByAddrSymbolsCommand, GetContextSymbolsCommand, TCFSymbolClass, TCFSymbolContextData, TCFTypeClass } from "./tcf/symbols";
 import { ContextResetCapability, GetCapabilitiesContextResetCommand, ResetContextResetCommand } from "./tcf/contextreset";
 import { TCFErrorCodes } from "./tcf/error";
 import { asArray, asNullableArray, asString, asStringArray, CancellationFunction, EMPTY_BUFFER, InterruptedError, parseResponse, responseLengthAbout, SimpleCommand, TCFPartialResultError } from "./tcf/tcfutils";
@@ -22,11 +22,11 @@ import { ClientVariable, FixedNameProvider, RawValueProvider, SymbolNameProvider
 import * as validateBreakpointData from './tcf/validators/validate-BreakpointData';
 
 class EvaluatedRawValueProvider implements RawValueProvider {
-    constructor(private readonly rawValue: Buffer, private readonly bigEndian: boolean) {
+    constructor(private readonly rawValue: Buffer, private readonly bigEndian: boolean, private readonly size?: number) {
     }
 
     async value(): Promise<Buffer | undefined> {
-        return decodeEvaluatedValue(this.rawValue);
+        return decodeEvaluatedValue(this.rawValue, this.size);
     }
 
     isBigEndian(): boolean {
@@ -56,8 +56,8 @@ function tryDecodeBase64Text(text: string): Buffer | undefined {
     }
 }
 
-function decodeEvaluatedValue(rawValue: Buffer): Buffer {
-    if (rawValue.length === 0) {
+function decodeEvaluatedValue(rawValue: Buffer, size?: number): Buffer {
+    if (rawValue.length === 0 || rawValue.length === size) {
         return rawValue;
     }
     const text = rawValue.toString('utf8').trim();
@@ -105,6 +105,7 @@ export abstract class TCFClient extends AbstractTCFClient {
     private _threadsCache: { info: TCFContextData; state: TCFStateData }[] | undefined;
     private _threadsCacheTime: number = 0;
     private _threadsCachePromise: Promise<{ info: TCFContextData; state: TCFStateData }[]> | undefined;
+    private threadsGeneration = 0;
     private static readonly THREADS_CACHE_TTL_MS = 500;
 
     async getResetCapabilities(): Promise<ContextResetCapability[]> {
@@ -113,7 +114,12 @@ export abstract class TCFClient extends AbstractTCFClient {
     }
 
     async reset(contextId: string, type: string, suspendAfterReset: boolean = true): Promise<void> {
-        await this.sendCommand(new ResetContextResetCommand(contextId, type, suspendAfterReset));
+        this.invalidateThreads();
+        try {
+            await this.sendCommand(new ResetContextResetCommand(contextId, type, suspendAfterReset));
+        } finally {
+            this.invalidateThreads();
+        }
     }
 
     async getVariables(): Promise<ClientVariable[]> {
@@ -179,6 +185,7 @@ export abstract class TCFClient extends AbstractTCFClient {
             }
             if (!value) {
                 this.console.error("Evaluate expression error " + JSON.stringify(e)); //Eval error?
+                throw e;
             }
         }
 
@@ -187,11 +194,12 @@ export abstract class TCFClient extends AbstractTCFClient {
 
     async getExpressionIDVariable(ctx: string, stack: string, varName: string, displayName?: string): Promise<ClientVariable | undefined> {
         const evaluated = await this.evaluateVariable(varName);
-        if (!evaluated?.properties?.Type) {
-            this.console.error(`Could not parse value for ${varName} = ${JSON.stringify(evaluated)}`);
-            return undefined;
+        if (!evaluated?.properties) {
+            throw new Error(`Cannot display expression ${displayName || varName}: missing value properties`);
         }
-        const typeID = evaluated.properties.Type;
+        const expressionContext = evaluated.properties.Type ? undefined :
+            await this.sendCommand(new GetContextExpressionsCommand(varName));
+        const typeID = evaluated.properties.Type || expressionContext?.Type;
         const symbolID = evaluated.properties.Symbol;
 
         this.console.received(`Value ${varName} ${JSON.stringify(evaluated.properties)}`);
@@ -206,10 +214,31 @@ export abstract class TCFClient extends AbstractTCFClient {
             }
         }();
 
-        const typeDetails = await this.sendCommand(new GetContextSymbolsCommand(typeID));
+        let typeDetails: TCFSymbolContextData;
+        if (typeID) {
+            typeDetails = await this.sendCommand(new GetContextSymbolsCommand(typeID));
+        } else {
+            const typeClass = evaluated.properties.Class ?? expressionContext?.Class;
+            const bytes = decodeEvaluatedValue(evaluated.value, expressionContext?.Size);
+            const scalar = typeClass === TCFTypeClass.integer || typeClass === TCFTypeClass.cardinal ||
+                typeClass === TCFTypeClass.real;
+            const validWidth = typeClass === TCFTypeClass.real ? [4, 8].includes(bytes.length) :
+                [1, 2, 4, 8].includes(bytes.length);
+            if (!scalar || !validWidth ||
+                (expressionContext?.Size !== undefined && expressionContext.Size !== bytes.length) ||
+                evaluated.properties.ImplicitPointer || evaluated.properties.Pieces?.length ||
+                evaluated.properties.BitStride || evaluated.properties.BinaryScale || evaluated.properties.DecimalScale) {
+                throw new Error(`Cannot display expression ${displayName || varName}: unsupported scalar metadata or value width (class=${typeClass}, bytes=${bytes.length})`);
+            }
+            // Class describes a value type, not a symbol class. No symbol Type ID is required for scalars.
+            // Do not infer a character type from a one-byte arithmetic result.
+            // eslint-disable-next-line @typescript-eslint/naming-convention -- TCF metadata names.
+            typeDetails = { ID: varName, Class: TCFSymbolClass.type, TypeClass: typeClass };
+        }
         let symbolDetails;
         let nameProvider = new FixedNameProvider(displayName || varName);
-        let valueProvider: RawValueProvider = new EvaluatedRawValueProvider(evaluated.value, evaluated.properties.BigEndian ?? false);
+        let valueProvider: RawValueProvider = new EvaluatedRawValueProvider(
+            evaluated.value, evaluated.properties.BigEndian ?? false, expressionContext?.Size ?? typeDetails.Size);
 
         if (symbolID) {
             symbolDetails = await this.sendCommand(new GetContextSymbolsCommand(symbolID));
@@ -236,7 +265,21 @@ export abstract class TCFClient extends AbstractTCFClient {
         return helper.createVariable(typeDetails, symbolDetails, nameProvider, valueProvider);
     }
 
-    async getThreads() {
+    private invalidateThreads(): void {
+        this.threadsGeneration++;
+        this._threadsCache = undefined;
+        this._threadsCachePromise = undefined;
+    }
+
+    override disconnect(): void {
+        this.invalidateThreads();
+        super.disconnect();
+    }
+
+    async getThreads(refresh = false): Promise<{ info: TCFContextData; state: TCFStateData }[]> {
+        if (refresh) {
+            this.invalidateThreads();
+        }
         const now = Date.now();
         // Return cached result if still fresh (avoids flooding agent with tree walks).
         if (this._threadsCache && (now - this._threadsCacheTime) < TCFClient.THREADS_CACHE_TTL_MS) {
@@ -244,16 +287,25 @@ export abstract class TCFClient extends AbstractTCFClient {
         }
         // Coalesce concurrent calls: if a fetch is already in flight, share its promise.
         if (this._threadsCachePromise) {
-            return this._threadsCachePromise;
-        }
-        this._threadsCachePromise = this._fetchThreads();
-        try {
+            const generation = this.threadsGeneration;
             const result = await this._threadsCachePromise;
+            return generation === this.threadsGeneration ? result : this.getThreads();
+        }
+        const generation = this.threadsGeneration;
+        const pending = this._fetchThreads();
+        this._threadsCachePromise = pending;
+        try {
+            const result = await pending;
+            if (generation !== this.threadsGeneration) {
+                return this.getThreads();
+            }
             this._threadsCache = result;
             this._threadsCacheTime = Date.now();
             return result;
         } finally {
-            this._threadsCachePromise = undefined;
+            if (this._threadsCachePromise === pending) {
+                this._threadsCachePromise = undefined;
+            }
         }
     }
 
@@ -410,6 +462,7 @@ export abstract class TCFClient extends AbstractTCFClient {
 
     //see https://download.eclipse.org/tools/tcf/tcf-docs/TCF%20Service%20-%20Run%20Control.html#Events
     protected onRunControlEvent(event: string, datas: Buffer[]): void {
+        this.invalidateThreads();
         switch (event) {
             case "contextChanged":
             case "contextAdded":

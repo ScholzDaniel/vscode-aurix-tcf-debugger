@@ -9,7 +9,16 @@ vsc-extension-quickstart.md
 **/*.ts
 *pcap
 out/test/**
+test-results/**
+**/*.local.json
 docs/
 *.vsix
-!bin/**
+bin/aurixflasher/**
 bin/llvm-dwarfdump.exe
+ACS_TEST_MAP.md
+TESTING.md
+scripts/export-acs-map.ps1
+scripts/run-breakpoint-test.ps1
+scripts/run-test.ps1
+scripts/tc375.example.json
+scripts/test-tc375.ps1

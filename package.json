@@ -54,7 +54,11 @@
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
     "test": "node ./out/test/runTest.js",
-    "test:stress": "pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-stress.ps1",
+    "test:unit": "npm run compile && mocha --ui tdd ./out/test/suite/dapEvents.test.js ./out/test/suite/hardwareProfile.test.js ./out/test/suite/threadCache.test.js ./out/test/suite/stepOutStop.test.js ./out/test/suite/expressionValues.test.js ./out/test/suite/instructionControl.test.js ./out/test/suite/breakpointStopBarrier.test.js ./out/test/suite/stopFocusEvents.test.js ./out/test/suite/flashing.test.js",
+    "test:preflight": "tsc -p ./ && node ./out/test/runTest.js --preflight",
+    "test:hardware": "pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/run-test.ps1 -Hardware",
+    "test:tc375": "pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-tc375.ps1",
+    "test:stress": "pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/run-test.ps1 -Hardware -Runs 100 -BreakpointCycles 1000 -Grep \"1-12-2|breakpoint-cycles\"",
     "package": "npx vsce package --no-rewrite-relative-links -o vscode-aurix-tcf-debug.vsix"
   },
   "devDependencies": {
@@ -229,21 +233,6 @@
           "default": false,
           "description": "Automatically start the TCF agent when debugging session starts."
         },
-        "aurix-tcf.autoOpenDisassemblyView": {
-          "type": "boolean",
-          "default": true,
-          "description": "Automatically open the VS Code Disassembly view when an AURIX TCF debug session starts."
-        },
-        "aurix-tcf.autoLockDisassemblyView": {
-          "type": "boolean",
-          "default": true,
-          "description": "Lock the Disassembly view editor group after opening it."
-        },
-        "aurix-tcf.autoEvenEditorWidths": {
-          "type": "boolean",
-          "default": true,
-          "description": "Evenly size editor groups after opening the Disassembly view."
-        },
         "aurix-tcf.instructionSteppingDefault": {
           "type": "boolean",
           "default": false,
@@ -287,12 +276,13 @@
                 "type": "string"
               },
               "enableFlashing": {
-                "description": "If true, runs the bundled aurixflasher.exe with -elf <program> before starting the debug session",
+                "description": "Unavailable: the bundled Flasher has been removed. Keep false and flash externally. A Windows/Linux replacement is planned.",
+                "enum": [false],
                 "type": "boolean",
                 "default": false
               },
               "targetDevice": {
-                "description": "Target device name (must match lsmcdd.exe output; numeric ids are not supported). Used for agent -p and to resolve aurixflasher -id when enableFlashing is true.",
+                "description": "Target device name (must match lsmcdd.exe output; numeric ids are not supported). Used for agent -p.",
                 "type": "string"
               },
               "entryFunction": {
