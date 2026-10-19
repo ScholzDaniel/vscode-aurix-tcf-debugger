@@ -17,11 +17,12 @@ import { createGunzip } from 'zlib';
 import { showDebugConfigPanel } from './debugConfigPanel';
 import { LiveWatchProvider } from './liveWatchView';
 import { getSvdOptionsForDevice } from './svdCatalog';
+import { flashingUnavailableMessage, validateFlashingOptions } from './flashing';
 
 let tcfAgentProcess: ChildProcess | undefined;
+let agentStopPromise: Promise<void> = Promise.resolve();
 let extensionContext: vscode.ExtensionContext;
 let agentOutput: vscode.OutputChannel | undefined;
-let flasherOutput: vscode.OutputChannel | undefined;
 let activeAurixSessions = 0;
 let startingAurixSessions = 0;
 let pendingStopTimer: NodeJS.Timeout | undefined;
@@ -30,8 +31,6 @@ let lastAgentHost: string | undefined;
 let lastAgentPort: number | undefined;
 let enforcingMemoryInspectorSettings = false;
 const memoryInspectorExtensionId = 'eclipse-cdt.memory-inspector';
-const openedDisassemblySessions = new Set<string>();
-let resolvedDisassemblyOpenCommand: string | undefined;
 let instructionStepStatusItem: vscode.StatusBarItem | undefined;
 const instructionStepStateKey = 'aurix-tcf.instructionSteppingEnabled';
 let lastInstructionSteppingEnabled = false;
@@ -41,12 +40,9 @@ const liveWatchEnabledStateKey = 'aurix-tcf.liveWatch.enabled';
 const liveWatchIntervalStateKey = 'aurix-tcf.liveWatch.intervalMs';
 let lastLiveWatchEnabled = false;
 let lastLiveWatchIntervalMs = 1000;
-let preferredSourceViewColumn: vscode.ViewColumn | undefined;
-let lastAutoSourcePath: string | undefined;
-let lastAutoSourceLine: number | undefined;
+let sourceRevealGeneration = 0;
+let sourceRevealQueue: Promise<void> = Promise.resolve();
 const SVD_CACHE_FOLDER = 'svd-cache';
-const DISASSEMBLY_OPEN_DELAY_MS = 1200;
-const pendingDisassemblyOpenTimers = new Map<string, NodeJS.Timeout>();
 const LIVE_WATCH_INTERVAL_OPTIONS = [200, 500, 1000, 2000] as const;
 
 export function activate(context: vscode.ExtensionContext) {
@@ -54,7 +50,6 @@ export function activate(context: vscode.ExtensionContext) {
 	extensionContext = context;
 	console.log('Aurix TCF debugging extension is activating...');
 	agentOutput = vscode.window.createOutputChannel('AURIX TCF Agent');
-	flasherOutput = vscode.window.createOutputChannel('AURIX Flasher');
 	liveWatchProvider = new LiveWatchProvider(context);
 	context.subscriptions.push(liveWatchProvider);
 
@@ -277,11 +272,13 @@ export function activate(context: vscode.ExtensionContext) {
 	);
 	context.subscriptions.push(
 		vscode.debug.onDidChangeActiveDebugSession(() => {
+			sourceRevealGeneration++;
 			void liveWatchProvider?.refreshNow();
 		})
 	);
 	context.subscriptions.push(
 		vscode.debug.onDidChangeActiveStackItem((item) => {
+			sourceRevealGeneration++;
 			const session = vscode.debug.activeDebugSession;
 			if (!session || session.type !== 'aurix-tcf') {
 				return;
@@ -294,39 +291,7 @@ export function activate(context: vscode.ExtensionContext) {
 			if (!isStackFrame) {
 				return;
 			}
-			if (!openedDisassemblySessions.has(session.id)) {
-				if (!pendingDisassemblyOpenTimers.has(session.id)) {
-					const timer = setTimeout(() => {
-						pendingDisassemblyOpenTimers.delete(session.id);
-						const activeSession = vscode.debug.activeDebugSession;
-						const alive = !!activeSession && activeSession.id === session.id && activeSession.type === 'aurix-tcf';
-						if (!alive || openedDisassemblySessions.has(session.id)) {
-							return;
-						}
-						openedDisassemblySessions.add(session.id);
-						void openDisassemblyEditorLayout(session);
-					}, DISASSEMBLY_OPEN_DELAY_MS);
-					pendingDisassemblyOpenTimers.set(session.id, timer);
-				}
-			}
-			void autoRevealSourceForStackItem(item as vscode.DebugStackFrame);
-		})
-	);
-	context.subscriptions.push(
-		vscode.debug.onDidReceiveDebugSessionCustomEvent((e) => {
-			if (e.session.type !== 'aurix-tcf') {
-				return;
-			}
-			if (e.event !== 'aurix-tcf/sourceLocation') {
-				return;
-			}
-			const body = e.body as { path?: string; line?: number } | undefined;
-			const srcPath = body?.path;
-			const line = typeof body?.line === 'number' ? body.line : undefined;
-			if (!srcPath || line === undefined) {
-				return;
-			}
-			void autoRevealSourcePath(srcPath, line);
+			queueSourceReveal(item as vscode.DebugStackFrame);
 		})
 	);
 	context.subscriptions.push(
@@ -334,20 +299,14 @@ export function activate(context: vscode.ExtensionContext) {
 			if (session.type !== 'aurix-tcf') {
 				return;
 			}
-			const openTimer = pendingDisassemblyOpenTimers.get(session.id);
-			if (openTimer) {
-				clearTimeout(openTimer);
-				pendingDisassemblyOpenTimers.delete(session.id);
-			}
-			openedDisassemblySessions.delete(session.id);
+			sourceRevealGeneration++;
 			activeAurixSessions = Math.max(0, activeAurixSessions - 1);
 			if (activeAurixSessions === 0) {
 				updateInstructionSteppingStatus(lastInstructionSteppingEnabled, false);
 				updateLiveWatchStatus(lastLiveWatchEnabled, lastLiveWatchIntervalMs, false);
 				liveWatchProvider?.refreshScheduling(false, lastLiveWatchIntervalMs);
 			}
-			// Use a short, cancelable delay so VS Code Restart (terminate + immediate start)
-			// can reuse the same agent without kill+start churn.
+			// A new launch cancels this timer and awaits the owned agent's shutdown itself.
 			if (activeAurixSessions === 0) {
 				if (pendingStopTimer) {
 					clearTimeout(pendingStopTimer);
@@ -361,7 +320,7 @@ export function activate(context: vscode.ExtensionContext) {
 						activeAurixSessions === 0 &&
 						startingAurixSessions === 0
 					) {
-						void stopTCFAgent('debug session terminated');
+						void stopTCFAgent('debug session terminated').catch(reportAgentStopError);
 					}
 				}, 1000);
 			}
@@ -371,7 +330,7 @@ export function activate(context: vscode.ExtensionContext) {
 	// Handle agent lifecycle
 	context.subscriptions.push({
 		dispose: () => {
-			void stopTCFAgent('extension disposed');
+			void stopTCFAgent('extension disposed').catch(reportAgentStopError);
 		}
 	});
 
@@ -393,80 +352,11 @@ export class AurixTCFDebugAdapterFactory implements vscode.DebugAdapterDescripto
 		try {
 		const config = session.configuration;
 
-		// Pre-launch validation for Flash Hex (PPU / CDSP).
-		// AurixFlasher returns exit code 0 even when no HEX file is provided,
-		// so explicit validation is required to prevent silent failures.
-		{
-			const missingHexFiles: string[] = [];
-			if (config.ppuFlashHex === true) {
-				const ppuElf = resolveConfigPath(session, config.ppuElfPath);
-				if (!ppuElf) {
-					missingHexFiles.push('PPU: Flash Hex is enabled but no ELF file is specified.');
-				} else {
-					const hexPath = ppuElf.replace(/\.elf$/i, '.hex');
-					if (!fs.existsSync(hexPath)) {
-						missingHexFiles.push(`PPU: HEX file not found: ${hexPath}`);
-					}
-				}
-			}
-			if (config.cdspFlashHex === true) {
-				const cdspPaths: string[] = Array.isArray(config.cdspElfPaths) ? config.cdspElfPaths : [];
-				let anyCdsp = false;
-				for (let i = 0; i < cdspPaths.length; i++) {
-					const elfPath = resolveConfigPath(session, cdspPaths[i]);
-					if (elfPath) {
-						anyCdsp = true;
-						const hexPath = elfPath.replace(/\.elf$/i, '.hex');
-						if (!fs.existsSync(hexPath)) {
-							missingHexFiles.push(`CDSP${i}: HEX file not found: ${hexPath}`);
-						}
-					}
-				}
-				if (!anyCdsp) {
-					missingHexFiles.push('CDSP: Flash Hex is enabled but no ELF files are specified.');
-				}
-			}
-			if (missingHexFiles.length > 0) {
-				void vscode.window.showErrorMessage(
-					`Flash Hex validation failed:\n${missingHexFiles.join('\n')}`,
-					{ modal: true },
-				);
-				throw new Error('Flash Hex validation failed');
-			}
-		}
-
-		// Flash firmware via AurixFlasher (single invocation, matching Eclipse launcher).
-		// TriCore ELF uses -elf; PPU/CDSP HEX files use -hex.
-		if (config.enableFlashing === true) {
-			const resolvedElf = resolveConfigPath(session, config.program);
-			if (!resolvedElf) {
-				void vscode.window.showErrorMessage('Enable flashing is set but no program/ELF path is configured.');
-				throw new Error('enableFlashing requires a valid program path');
-			}
-
-			// Collect all HEX files for PPU/CDSP.
-			const hexFiles: string[] = [];
-			if (config.ppuFlashHex === true) {
-				const ppuElf = resolveConfigPath(session, config.ppuElfPath);
-				if (ppuElf) {
-					hexFiles.push(ppuElf.replace(/\.elf$/i, '.hex'));
-				}
-			}
-			if (config.cdspFlashHex === true) {
-				const cdspPaths: string[] = Array.isArray(config.cdspElfPaths) ? config.cdspElfPaths : [];
-				for (let i = 0; i < cdspPaths.length; i++) {
-					const elfPath = resolveConfigPath(session, cdspPaths[i]);
-					if (elfPath) {
-						hexFiles.push(elfPath.replace(/\.elf$/i, '.hex'));
-					}
-				}
-			}
-
-			await runAurixFlasher(
-				resolvedElf,
-				typeof config.targetDevice === 'string' ? config.targetDevice : undefined,
-				hexFiles,
-			);
+		try {
+			validateFlashingOptions(config);
+		} catch (error) {
+			void vscode.window.showErrorMessage(flashingUnavailableMessage);
+			throw error;
 		}
 
 		// Auto-start TCF agent if requested
@@ -503,10 +393,11 @@ export class AurixTCFDebugAdapterFactory implements vscode.DebugAdapterDescripto
 				agentArgs.push('-e', config.entryFunction);
 			}
 			
-			// -b core_number
-			if (config.core !== undefined) {
-				agentArgs.push('-b', String(config.core));
-			}
+			// -b is the user breakpoint count, not the selected core.
+			const enabledSourceBreakpoints = vscode.debug.breakpoints.filter(
+				breakpoint => breakpoint.enabled && breakpoint instanceof vscode.SourceBreakpoint
+			).length;
+			agentArgs.push('-b', String(enabledSourceBreakpoints));
 			
 			// -r svd_file_path
 			if (config.svdFile) {
@@ -547,14 +438,7 @@ export class AurixTCFDebugAdapterFactory implements vscode.DebugAdapterDescripto
 			const host = config.host || '127.0.0.1';
 			const port = config.port || 1534;
 
-			// Keep this simple: if an agent is already running, reuse it.
-			// This makes VS Code Restart stable (no kill+start churn).
-			if (tcfAgentProcess && tcfAgentProcess.exitCode === null) {
-				agentOutput?.appendLine('Reusing already running TCF agent for new session.');
-				await waitForTcpPort(host, port, 15_000);
-			} else {
-				await startTCFAgent(agentPath, agentArgs, host, port);
-			}
+			await startTCFAgent(agentPath, agentArgs, host, port);
 		}
 
 		// Enable path mapper based on workspace trust and configuration
@@ -569,26 +453,6 @@ export class AurixTCFDebugAdapterFactory implements vscode.DebugAdapterDescripto
 		}
 	}
 }
-
-function resolveConfigPath(session: vscode.DebugSession, p: unknown): string | undefined {
-	// Resolve ${workspaceFolder} and make absolute
-	if (typeof p !== 'string' || p.trim() === '') {
-		return undefined;
-	}
-	let out = p;
-	const ws = session.workspaceFolder?.uri.fsPath || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
-	if (ws) {
-		out = out.replaceAll('${workspaceFolder}', ws);
-		out = out.replaceAll('${workspaceRoot}', ws);
-	}
-	// Normalize separators for Windows tools.
-	out = out.replace(/\//g, path.sep);
-	if (!path.isAbsolute(out) && ws) {
-		out = path.resolve(ws, out);
-	}
-	return out;
-}
-
 
 function parseCsvLine(line: string): string[] {
 	// Minimal CSV parser supporting quoted fields.
@@ -688,134 +552,6 @@ async function validateAgentTargetDevice(targetDevice: string): Promise<void> {
 			throw e;
 		}
 	}
-}
-
-async function resolveFlasherDeviceId(device: string | undefined): Promise<string> {
-	const raw = (device ?? '').trim();
-	if (raw !== '' && /^\d+$/.test(raw)) {
-		throw new Error(`targetDevice must be a device name (not a numeric id).`);
-	}
-
-	const devices = await listLsmcddDevices();
-	if (devices.length === 0) {
-		throw new Error('No devices detected by lsmcdd.exe');
-	}
-
-	// If the user did not specify a device and there is exactly one, pick it.
-	if (raw === '' && devices.length === 1) {
-		return devices[0].id;
-	}
-	if (raw === '') {
-		const names = devices.map((d) => d.name).join('; ');
-		throw new Error(`Multiple devices detected; please set targetDevice. Available: ${names}`);
-	}
-
-	const rawLower = raw.toLowerCase();
-	const exactName = devices.find((d) => d.name === raw) ?? devices.find((d) => d.name.toLowerCase() === rawLower);
-	if (exactName) {
-		return exactName.id;
-	}
-
-	// Accept matching by family (e.g., TC4Dx / TC37x) as a fallback, but only if unique.
-	const familyMatches = devices.filter((d) => (d.family ?? '').trim() !== '' && d.family.toLowerCase() === rawLower);
-	if (familyMatches.length === 1) {
-		return familyMatches[0].id;
-	}
-	if (familyMatches.length > 1) {
-		const names = familyMatches.map((d) => d.name).join('; ');
-		throw new Error(`Device '${raw}' matches multiple devices (by family). Matches: ${names}`);
-	}
-
-	const names = devices.map((d) => d.name).join('; ');
-	throw new Error(`Device '${raw}' not found. Available: ${names}`);
-}
-
-async function runAurixFlasher(elfPath: string, targetDevice: string | undefined, hexFiles: string[] = []): Promise<void> {
-	// Single invocation matching Eclipse launcher:
-	//   aurixflasher.exe -gui off -elf <tricore.elf> [-hex <ppu.hex> ...] -start off -ver on -id <deviceId>
-	// If first attempt fails, retry with -erase all.
-	const flasherExe = path.join(extensionContext.extensionPath, 'bin', 'aurixflasher', 'aurixflasher.exe');
-	const flasherCwd = path.dirname(flasherExe);
-
-	if (!fs.existsSync(flasherExe)) {
-		void vscode.window.showErrorMessage(`aurixflasher.exe not found: ${flasherExe}`);
-		throw new Error('aurixflasher.exe not found');
-	}
-	if (!fs.existsSync(elfPath)) {
-		void vscode.window.showErrorMessage(`ELF file not found: ${elfPath}`);
-		throw new Error('ELF file not found');
-	}
-	for (const hex of hexFiles) {
-		if (!fs.existsSync(hex)) {
-			void vscode.window.showErrorMessage(`HEX file not found: ${hex}`);
-			throw new Error(`HEX file not found: ${hex}`);
-		}
-	}
-
-	// Show output early so users see progress while we run lsmcdd.exe.
-	flasherOutput?.show(true);
-	flasherOutput?.appendLine(`Flashing ELF: ${elfPath}`);
-	for (const hex of hexFiles) {
-		flasherOutput?.appendLine(`Flashing HEX: ${hex}`);
-	}
-	flasherOutput?.appendLine(`Resolving device id via lsmcdd.exe (targetDevice='${targetDevice ?? ''}')...`);
-
-	let deviceId: string;
-	try {
-		deviceId = await resolveFlasherDeviceId(targetDevice);
-	} catch (e) {
-		const msg = e instanceof Error ? e.message : String(e);
-		flasherOutput?.appendLine(`Failed to resolve device id: ${msg}`);
-		void vscode.window.showErrorMessage(`Flashing failed: cannot resolve device id from lsmcdd.exe output. ${msg}`);
-		throw e;
-	}
-
-	// Build command: -gui off -elf <path> [-hex <path>]... -start off -ver on -id <deviceId>
-	const baseArgs: string[] = [
-		'-gui', 'off',
-		'-elf', elfPath,
-	];
-	for (const hex of hexFiles) {
-		baseArgs.push('-hex', hex);
-	}
-	baseArgs.push('-start', 'off', '-ver', 'on', '-id', deviceId);
-
-	flasherOutput?.appendLine(`Device: ${targetDevice ?? ''} (id ${deviceId})`);
-	flasherOutput?.appendLine(`Command: ${flasherExe} ${baseArgs.join(' ')}`);
-
-	const runFlasher = (args: string[]): Promise<{ exitCode: number | null; stdout: string; stderr: string }> => {
-		return new Promise((resolve) => {
-			execFile(flasherExe, args, { cwd: flasherCwd, windowsHide: true, maxBuffer: 20 * 1024 * 1024 }, (err, stdout, stderr) => {
-				const exitCode = err && 'code' in err ? (err as any).code as number : (err ? 1 : 0);
-				resolve({ exitCode, stdout: String(stdout ?? ''), stderr: String(stderr ?? '') });
-			});
-		});
-	};
-
-	// First attempt.
-	let result = await runFlasher(baseArgs);
-	if (result.stdout) { flasherOutput?.appendLine(result.stdout.trimEnd()); }
-	if (result.stderr) { flasherOutput?.appendLine(result.stderr.trimEnd()); }
-
-	if (result.exitCode !== 0) {
-		// Retry with -erase all (matching Eclipse launcher behaviour).
-		flasherOutput?.appendLine('Flashing failed, retrying with -erase all...');
-		const retryArgs = [...baseArgs, '-erase', 'all'];
-		flasherOutput?.appendLine(`Command: ${flasherExe} ${retryArgs.join(' ')}`);
-
-		result = await runFlasher(retryArgs);
-		if (result.stdout) { flasherOutput?.appendLine(result.stdout.trimEnd()); }
-		if (result.stderr) { flasherOutput?.appendLine(result.stderr.trimEnd()); }
-
-		if (result.exitCode !== 0) {
-			const msg = `Flashing failed even after erasing. Exit code: ${result.exitCode}`;
-			flasherOutput?.appendLine(msg);
-			void vscode.window.showErrorMessage(msg);
-			throw new Error(msg);
-		}
-	}
-
-	flasherOutput?.appendLine('Flashing completed successfully.');
 }
 
 function splitCommandLine(text: string): string[] {
@@ -1084,8 +820,9 @@ export class AurixTCFConfigurationProvider implements vscode.DebugConfigurationP
 }
 
 async function startTCFAgent(agentPath: string, args: string[], host: string, port: number): Promise<void> {
-	// Stop existing agent if running (should be rare now; we prefer reusing it)
+	// A new session must not inherit the previous agent's launch arguments or breakpoints.
 	await stopTCFAgent('restart requested');
+	await waitForTcpPortClosed(host, port, 1000);
 
 	lastAgentHost = host;
 	lastAgentPort = port;
@@ -1094,37 +831,56 @@ async function startTCFAgent(agentPath: string, args: string[], host: string, po
 	agentOutput?.appendLine(`Starting TCF agent: ${agentPath}`);
 	agentOutput?.appendLine(`Agent arguments: ${args.join(' ')}`);
 
-	tcfAgentProcess = spawn(agentPath, args, {
+	const proc = spawn(agentPath, args, {
 		cwd: path.dirname(agentPath),
 		stdio: ['ignore', 'pipe', 'pipe'],
 		windowsHide: true,
 	});
+	tcfAgentProcess = proc;
 
-	tcfAgentProcess.stdout?.on('data', (data) => {
+	proc.stdout?.on('data', (data) => {
 		agentOutput?.appendLine(String(data).trimEnd());
 	});
 
-	tcfAgentProcess.stderr?.on('data', (data) => {
+	proc.stderr?.on('data', (data) => {
 		agentOutput?.appendLine(String(data).trimEnd());
 	});
 
-	tcfAgentProcess.on('exit', (code, signal) => {
+	proc.on('exit', (code, signal) => {
 		agentOutput?.appendLine(`TCF agent exited with code ${code}${signal ? ` (signal ${signal})` : ''}`);
-		tcfAgentProcess = undefined;
+		if (tcfAgentProcess === proc) {
+			tcfAgentProcess = undefined;
+		}
 	});
 
-	tcfAgentProcess.on('error', (err) => {
+	proc.on('error', (err) => {
 		agentOutput?.appendLine(`Failed to start TCF agent: ${err.message}`);
 	});
 
 	// Avoid a race where the debug adapter tries to connect before the agent has
 	// started listening on the requested TCP port.
 	agentOutput?.appendLine(`Waiting for TCF agent to listen on ${host}:${port}...`);
-	await waitForTcpPort(host, port, 15_000);
+	try {
+		await waitForTcpPort(host, port, 15_000);
+	} catch (error) {
+		await stopTCFAgent('agent startup failed');
+		throw error;
+	}
 	agentOutput?.appendLine(`TCF agent is listening on ${host}:${port}`);
 }
 
-async function stopTCFAgent(reason: string): Promise<void> {
+function reportAgentStopError(error: unknown): void {
+	const message = `Failed to stop TCF agent: ${String(error)}`;
+	agentOutput?.appendLine(message);
+	void vscode.window.showErrorMessage(message);
+}
+
+function stopTCFAgent(reason: string): Promise<void> {
+	agentStopPromise = agentStopPromise.then(() => stopTCFAgentProcess(reason));
+	return agentStopPromise;
+}
+
+async function stopTCFAgentProcess(reason: string): Promise<void> {
 	// Stop the TCF agent process if running
 	if (!tcfAgentProcess) {
 		return;
@@ -1135,17 +891,12 @@ async function stopTCFAgent(reason: string): Promise<void> {
 	tcfAgentProcess = undefined;
 
 	if (!pid) {
-		try {
-			proc.kill();
-		} catch {
-			// ignore
-		}
 		return;
 	}
 
 	agentOutput?.appendLine(`Stopping TCF agent (pid ${pid}) - ${reason}`);
 
-	try {
+	if (proc.exitCode === null && proc.signalCode === null) {
 		if (process.platform === 'win32') {
 			// Kill the whole process tree; aurix-debugger.exe may spawn helper processes.
 			await new Promise<void>((resolve, reject) => {
@@ -1164,56 +915,14 @@ async function stopTCFAgent(reason: string): Promise<void> {
 				});
 			});
 		} else {
-			// Best-effort on non-Windows.
-			proc.kill();
-		}
-	} catch (e) {
-		// Fall back to a plain kill.
-		try {
-			proc.kill();
-		} catch {
-			// ignore
-		}
-		agentOutput?.appendLine(`Failed to stop TCF agent cleanly: ${String(e)}`);
-	}
-
-	// Give the OS a moment to release the port.
-	await new Promise(resolve => setTimeout(resolve, 300));
-	if (lastAgentHost && typeof lastAgentPort === 'number') {
-		try {
-			await waitForTcpPortClosed(lastAgentHost, lastAgentPort, 10_000);
-		} catch {
-			// Some agents detach/spawn a helper that keeps listening after the parent PID is killed.
-			// Keep this simple: if the port is still open, force-kill the agent image name.
-			if (process.platform === 'win32') {
-				// If a new session already started (Restart), do NOT do the image-name kill,
-				// otherwise we might kill the new agent we just launched/reused.
-				if (activeAurixSessions > 0 || startingAurixSessions > 0) {
-					agentOutput?.appendLine('Port still open, but a session is active/starting; skipping taskkill by image name.');
-					return;
-				}
-				agentOutput?.appendLine('Port still open after taskkill by PID; forcing taskkill by image name aurix-debugger.exe');
-				try {
-					await new Promise<void>((resolve, reject) => {
-						execFile('taskkill', ['/IM', 'aurix-debugger.exe', '/T', '/F'], { windowsHide: true }, (err, stdout, stderr) => {
-							if (stdout) {
-								agentOutput?.appendLine(String(stdout).trimEnd());
-							}
-							if (stderr) {
-								agentOutput?.appendLine(String(stderr).trimEnd());
-							}
-							if (err) {
-								reject(err);
-								return;
-							}
-							resolve();
-						});
-					});
-				} catch (e) {
-					agentOutput?.appendLine(`Failed to taskkill aurix-debugger.exe by image name: ${String(e)}`);
-				}
+			if (!proc.kill()) {
+				throw new Error(`Failed to signal TCF agent ${pid}`);
 			}
 		}
+	}
+
+	if (lastAgentHost && typeof lastAgentPort === 'number') {
+		await waitForTcpPortClosed(lastAgentHost, lastAgentPort, 10_000);
 	}
 }
 
@@ -1313,105 +1022,6 @@ async function ensureMemoryInspectorSettings(): Promise<void> {
 	} finally {
 		enforcingMemoryInspectorSettings = false;
 	}
-}
-
-async function openDisassemblyEditorLayout(session: vscode.DebugSession): Promise<void> {
-	if (session.type !== 'aurix-tcf') {
-		return;
-	}
-	const cfg = vscode.workspace.getConfiguration('aurix-tcf');
-	const autoOpen = cfg.get<boolean>('autoOpenDisassemblyView', true);
-	if (!autoOpen) {
-		return;
-	}
-	const autoLock = cfg.get<boolean>('autoLockDisassemblyView', true);
-	const autoEven = cfg.get<boolean>('autoEvenEditorWidths', true);
-
-	// Preserve the current editor focus so we can return the user to source.
-	const startEditor = vscode.window.activeTextEditor;
-	const startViewColumn = startEditor?.viewColumn;
-	if (startViewColumn !== undefined) {
-		preferredSourceViewColumn = startViewColumn;
-	}
-
-	// Give VS Code a moment to settle the debug UI before opening the view.
-	await new Promise((resolve) => setTimeout(resolve, 150));
-
-	try {
-		const cmd = await resolveDisassemblyOpenCommand();
-		if (!cmd) {
-			throw new Error('No disassembly command found in VS Code command registry.');
-		}
-		await vscode.commands.executeCommand(cmd);
-	} catch (e) {
-		agentOutput?.appendLine(`Failed to open disassembly view: ${String(e)}`);
-		return;
-	}
-
-	try {
-		await vscode.commands.executeCommand('workbench.action.moveEditorToRightGroup');
-	} catch (e) {
-		agentOutput?.appendLine(`Failed to move disassembly view to the right: ${String(e)}`);
-	}
-
-	if (autoLock) {
-		try {
-			const commands = await vscode.commands.getCommands(true);
-			if (commands.includes('workbench.action.unlockEditorGroup')) {
-				await vscode.commands.executeCommand('workbench.action.unlockEditorGroup');
-			}
-			await vscode.commands.executeCommand('workbench.action.lockEditorGroup');
-		} catch (e) {
-			agentOutput?.appendLine(`Failed to lock disassembly editor group: ${String(e)}`);
-		}
-	}
-
-	if (autoEven) {
-		try {
-			await vscode.commands.executeCommand('workbench.action.evenEditorWidths');
-		} catch (e) {
-			agentOutput?.appendLine(`Failed to even editor widths: ${String(e)}`);
-		}
-	}
-
-	if (startEditor && startViewColumn) {
-		try {
-			await vscode.window.showTextDocument(startEditor.document, {
-				viewColumn: startViewColumn,
-				preview: false,
-				preserveFocus: false
-			});
-		} catch (e) {
-			agentOutput?.appendLine(`Failed to restore source editor focus: ${String(e)}`);
-		}
-	}
-}
-
-async function resolveDisassemblyOpenCommand(): Promise<string | undefined> {
-	if (resolvedDisassemblyOpenCommand) {
-		return resolvedDisassemblyOpenCommand;
-	}
-	const preferred = ['debug.action.openDisassemblyView', 'debug.openDisassemblyView', 'workbench.action.debug.openDisassemblyView'];
-	try {
-		const commands = await vscode.commands.getCommands(true);
-		for (const cmd of preferred) {
-			if (commands.includes(cmd)) {
-				resolvedDisassemblyOpenCommand = cmd;
-				return cmd;
-			}
-		}
-		const fallback = commands.find((cmd) => /disassembly/i.test(cmd) && /(open|view)/i.test(cmd));
-		if (fallback) {
-			resolvedDisassemblyOpenCommand = fallback;
-			return fallback;
-		}
-		agentOutput?.appendLine(
-			`Disassembly command not found. Available disassembly-related commands: ${commands.filter(c => /disassembly/i.test(c)).join(', ')}`
-		);
-	} catch (e) {
-		agentOutput?.appendLine(`Failed to resolve disassembly command: ${String(e)}`);
-	}
-	return undefined;
 }
 
 async function getInstructionSteppingEnabled(): Promise<boolean> {
@@ -1553,88 +1163,56 @@ async function syncLiveWatchOnSessionStart(session: vscode.DebugSession): Promis
 	await setLiveWatchMode(enabled, intervalMs, session);
 }
 
-async function autoRevealSourceForStackItem(item: vscode.DebugStackFrame): Promise<void> {
-	const frame = item as any;
-	const source = frame?.source as { path?: string } | undefined;
-	if (!source || !source.path) {
-		return;
-	}
-	let srcPath = source.path;
-	// Normalize path separators for the current OS.
-	if (path.sep === '\\') {
-		srcPath = srcPath.replace(/\//g, '\\');
-	}
-	const isAbs = path.isAbsolute(srcPath) || /^[a-zA-Z]:[\\/]/.test(srcPath);
-	if (!isAbs) {
-		// Try to resolve relative paths against workspace folders.
-		const folders = vscode.workspace.workspaceFolders ?? [];
-		for (const folder of folders) {
-			const candidate = path.resolve(folder.uri.fsPath, srcPath);
-			if (fs.existsSync(candidate)) {
-				srcPath = candidate;
-				break;
-			}
-		}
-	}
-	// Ignore disassembly or non-file sources we still couldn't resolve.
-	if (!(path.isAbsolute(srcPath) || /^[a-zA-Z]:[\\/]/.test(srcPath))) {
-		return;
-	}
-	if (!fs.existsSync(srcPath)) {
-		return;
-	}
-	const line = typeof frame.line === 'number' && frame.line > 0 ? frame.line : 1;
-	await autoRevealSourcePath(srcPath, line);
+function queueSourceReveal(item: vscode.DebugStackFrame): void {
+	const generation = ++sourceRevealGeneration;
+	sourceRevealQueue = sourceRevealQueue.then(() => revealSelectedFrameSource(item, generation));
 }
 
-async function autoRevealSourcePath(srcPath: string, line: number): Promise<void> {
-	if (lastAutoSourcePath === srcPath && lastAutoSourceLine === line) {
+async function revealSelectedFrameSource(item: vscode.DebugStackFrame, generation: number): Promise<void> {
+	const isCurrent = () => {
+		const current = vscode.debug.activeStackItem;
+		return sourceRevealGeneration === generation && vscode.debug.activeDebugSession?.id === item.session.id &&
+			current?.session.id === item.session.id && current.threadId === item.threadId &&
+			'frameId' in current && current.frameId === item.frameId;
+	};
+	if (!isCurrent()) {
 		return;
 	}
 	try {
-		const norm = normalizePathForCompare(srcPath);
-		const visible = vscode.window.visibleTextEditors.find((ed) => {
-			const edPath = ed.document?.uri?.fsPath;
-			return edPath ? normalizePathForCompare(edPath) === norm : false;
-		});
-
-		let editor: vscode.TextEditor;
-		if (visible) {
-			editor = await vscode.window.showTextDocument(visible.document, {
-				viewColumn: visible.viewColumn,
-				preview: false,
-				preserveFocus: false
-			});
-		} else {
-			const uri = vscode.Uri.file(srcPath);
-			const doc = await vscode.workspace.openTextDocument(uri);
-			const viewColumn = preferredSourceViewColumn ?? vscode.ViewColumn.One;
-			editor = await vscode.window.showTextDocument(doc, {
-				viewColumn,
-				preview: false,
-				preserveFocus: false
-			});
+		const result: { source?: { path: string; line: number } } = await item.session.customRequest(
+			'aurix-tcf/frameSource', { threadId: item.threadId, frameId: item.frameId });
+		if (!isCurrent() || !result.source) {
+			return;
 		}
-		const pos = new vscode.Position(line - 1, 0);
-		editor.selection = new vscode.Selection(pos, pos);
-		editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
-		lastAutoSourcePath = srcPath;
-		lastAutoSourceLine = line;
-	} catch (e) {
-		agentOutput?.appendLine(`Failed to auto-open source file: ${String(e)}`);
+		const source = result.source;
+		if (typeof source.path !== 'string' || !Number.isInteger(source.line) || source.line < 1) {
+			throw new Error('Invalid source location for selected frame');
+		}
+		const document = await vscode.workspace.openTextDocument(vscode.Uri.file(source.path));
+		if (!isCurrent()) {
+			return;
+		}
+		const visible = vscode.window.visibleTextEditors.find(editor => editor.document.uri.toString() === document.uri.toString());
+		const editor = await vscode.window.showTextDocument(document, {
+			viewColumn: visible?.viewColumn ?? vscode.ViewColumn.One,
+			preview: false, preserveFocus: true
+		});
+		if (!isCurrent()) {
+			return;
+		}
+		const position = new vscode.Position(source.line - 1, 0);
+		editor.selection = new vscode.Selection(position, position);
+		editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+	} catch (error) {
+		if (isCurrent()) {
+			agentOutput?.appendLine(`Failed to reveal selected core/frame source: ${String(error)}`);
+		}
 	}
 }
 
-function normalizePathForCompare(p: string): string {
-	const resolved = path.resolve(p);
-	return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
-}
-
-
 export function deactivate() {
-	void stopTCFAgent('extension deactivate');
+	sourceRevealGeneration++;
+	void stopTCFAgent('extension deactivate').catch(reportAgentStopError);
 	agentOutput?.dispose();
 	agentOutput = undefined;
-	flasherOutput?.dispose();
-	flasherOutput = undefined;
 }

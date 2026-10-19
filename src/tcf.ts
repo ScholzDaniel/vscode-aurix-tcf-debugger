@@ -198,6 +198,10 @@ export abstract class AbstractTCFClient {
         await this.resume(contextID, Modes.nextInstruction);
     }
 
+    async stepInInstruction(contextID: string | undefined) {
+        await this.resume(contextID, Modes.stepInInstruction);
+    }
+
     /**
      *
      * @param contextID if undefined, resume everything. Otherwise resume the given context 

@@ -1,7 +1,7 @@
 "use strict";
 module.exports = validate20;
 module.exports.default = validate20;
-const schema22 = {"$schema":"http://json-schema.org/draft-07/schema#","definitions":{"PieceValue":{"properties":{"Size":{"type":"number"},"Value":{"type":"string"}},"required":["Size"],"type":"object"}},"properties":{"Address":{"type":"number"},"BigEndian":{"type":"boolean"},"BinaryScale":{"type":"number"},"BitStride":{"type":"number"},"Class":{"enum":[0,1,2,3,4,5,6,7,8,9],"type":"number"},"DecimalScale":{"type":"number"},"ImplicitPointer":{"type":"boolean"},"Pieces":{"items":{"$ref":"#/definitions/PieceValue"},"type":"array"},"Register":{"type":"string"},"Symbol":{"type":"string"},"Type":{"type":"string"}},"type":"object"};
+const schema22 = {"$schema":"http://json-schema.org/draft-07/schema#","definitions":{"PieceValue":{"properties":{"Size":{"type":"number"},"Value":{"type":"string"}},"required":["Size"],"type":"object"}},"properties":{"Address":{"type":"number"},"BigEndian":{"type":"boolean"},"BinaryScale":{"type":"number"},"BitStride":{"type":"number"},"Class":{"enum":[0,1,2,3,4,5,6,7,8,9,10],"type":"number"},"DecimalScale":{"type":"number"},"ImplicitPointer":{"type":"boolean"},"Pieces":{"items":{"$ref":"#/definitions/PieceValue"},"type":"array"},"Register":{"type":"string"},"Symbol":{"type":"string"},"Type":{"type":"string"}},"type":"object"};
 const schema23 = {"properties":{"Size":{"type":"number"},"Value":{"type":"string"}},"required":["Size"],"type":"object"};
 
 function validate20(data, {instancePath="", parentData, parentDataProperty, rootData=data}={}){
@@ -67,7 +67,7 @@ if(!((typeof data4 == "number") && (isFinite(data4)))){
 validate20.errors = [{instancePath:instancePath+"/Class",schemaPath:"#/properties/Class/type",keyword:"type",params:{type: "number"},message:"must be number"}];
 return false;
 }
-if(!((((((((((data4 === 0) || (data4 === 1)) || (data4 === 2)) || (data4 === 3)) || (data4 === 4)) || (data4 === 5)) || (data4 === 6)) || (data4 === 7)) || (data4 === 8)) || (data4 === 9))){
+if(!(((((((((((data4 === 0) || (data4 === 1)) || (data4 === 2)) || (data4 === 3)) || (data4 === 4)) || (data4 === 5)) || (data4 === 6)) || (data4 === 7)) || (data4 === 8)) || (data4 === 9)) || (data4 === 10))){
 validate20.errors = [{instancePath:instancePath+"/Class",schemaPath:"#/properties/Class/enum",keyword:"enum",params:{allowedValues: schema22.properties.Class.enum},message:"must be equal to one of the allowed values"}];
 return false;
 }

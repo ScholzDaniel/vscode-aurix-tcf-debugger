@@ -7,6 +7,7 @@ import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getSvdOptionsForDevice } from './svdCatalog';
+import { flashingUnavailableMessage, validateFlashingOptions } from './flashing';
 
 function esc(s: string): string {
 	return s
@@ -161,10 +162,10 @@ export async function showDebugConfigPanel(context: vscode.ExtensionContext): Pr
 			// Save last-used values so reopening the panel keeps them.
 			await savePanelValues(context, msg.config);
 
-			// Validate Flash Hex: check HEX file existence before launching.
-			const flashHexErrors = validateFlashHexFiles(msg.config);
-			if (flashHexErrors.length > 0) {
-				void panel.webview.postMessage({ type: 'flashHexValidationErrors', errors: flashHexErrors });
+			try {
+				validateFlashingOptions(msg.config);
+			} catch {
+				void vscode.window.showErrorMessage(flashingUnavailableMessage);
 				return;
 			}
 
@@ -258,44 +259,6 @@ async function listConnectedDevices(context: vscode.ExtensionContext): Promise<s
 	return parseDeviceNames(output);
 }
 
-function elfPathToHex(elfPath: string): string {
-	return elfPath.replace(/\.elf$/i, '.hex');
-}
-
-// Validate Flash Hex settings: check ELF paths and HEX file existence.
-function validateFlashHexFiles(config: any): string[] {
-	const errors: string[] = [];
-	if (config.ppuFlashHex === true) {
-		const ppuElf = typeof config.ppuElfPath === 'string' ? config.ppuElfPath.trim() : '';
-		if (!ppuElf) {
-			errors.push('PPU: Flash Hex is enabled but no ELF file is specified.');
-		} else {
-			const hexPath = elfPathToHex(ppuElf);
-			if (!fs.existsSync(hexPath)) {
-				errors.push(`PPU: HEX file not found: ${hexPath}`);
-			}
-		}
-	}
-	if (config.cdspFlashHex === true) {
-		const cdspPaths: string[] = Array.isArray(config.cdspElfPaths) ? config.cdspElfPaths : [];
-		let anyCdsp = false;
-		for (let i = 0; i < cdspPaths.length; i++) {
-			const elf = typeof cdspPaths[i] === 'string' ? cdspPaths[i].trim() : '';
-			if (elf) {
-				anyCdsp = true;
-				const hexPath = elfPathToHex(elf);
-				if (!fs.existsSync(hexPath)) {
-					errors.push(`CDSP${i}: HEX file not found: ${hexPath}`);
-				}
-			}
-		}
-		if (!anyCdsp) {
-			errors.push('CDSP: Flash Hex is enabled but no ELF files are specified.');
-		}
-	}
-	return errors;
-}
-
 // Persist the last-used panel values.
 async function savePanelValues(context: vscode.ExtensionContext, config: any): Promise<void> {
 	const cfg = config as any;
@@ -333,9 +296,6 @@ function getHtml(defaults: AurixPanelDefaults): string {
 	const ppuElfValue = esc(defaults.values.ppuElfPath || '');
 	const scrElfValue = esc(defaults.values.scrElfPath || '');
 	const cdspElfValues = Array.isArray(defaults.values.cdspElfPaths) ? defaults.values.cdspElfPaths : new Array(12).fill('');
-	const enableFlashingChecked = defaults.values.enableFlashing ? 'checked' : '';
-	const ppuFlashHexChecked = defaults.values.ppuFlashHex ? 'checked' : '';
-	const cdspFlashHexChecked = defaults.values.cdspFlashHex ? 'checked' : '';
 	const entryFunctionValue = esc(defaults.values.entryFunction || '');
 	const targetDeviceValue = esc(defaults.values.targetDevice || '');
 	const svdValue = esc(defaults.values.svdFile || '');
@@ -506,9 +466,9 @@ function getHtml(defaults: AurixPanelDefaults): string {
 
 			<label for="program">Debug binary</label>
 			<div class="inlineRow">
-				<div class="checkbox" title="Runs aurixflasher.exe before starting the debug session">
-					<input type="checkbox" id="enableFlashing" ${enableFlashingChecked} />
-					<span class="small">Enable flashing</span>
+				<div class="checkbox" title="Integrated flashing is unavailable; flash the matching firmware externally.">
+					<input type="checkbox" id="enableFlashing" disabled />
+					<span class="small">Flashing unavailable</span>
 				</div>
 				<input id="program" placeholder="C:\\path\\to\\program.elf" value="${programValue}" />
 				<button type="button" class="browseElf" data-key="program">Browse...</button>
@@ -540,6 +500,7 @@ function getHtml(defaults: AurixPanelDefaults): string {
 				<span class="small">Show TCF protocol messages in the debug console</span>
 			</div>
 		</div>
+		<div class="small">The bundled Flasher has been removed. Flash the matching firmware externally before debugging. Saved flashing selections are disabled in this panel. A replacement with Windows/Linux support is planned, not yet available.</div>
 	</div>
 
 	<div class="tab" id="tab-cores">
@@ -551,10 +512,10 @@ function getHtml(defaults: AurixPanelDefaults): string {
 				<button type="button" class="browseElf" data-key="ppuElfPath">Browse...</button>
 			</div>
 			<div class="checkbox" style="margin-top: 8px;">
-				<input type="checkbox" id="ppuFlashHex" ${ppuFlashHexChecked} />
-				<span>Flash Hex</span>
+				<input type="checkbox" id="ppuFlashHex" disabled />
+				<span>Flash Hex (unavailable)</span>
 			</div>
-			<div class="small" style="margin-top: 4px;">AurixFlasher will use the HEX file corresponding to the selected ELF for flashing. Please ensure the HEX file exists.</div>
+			<div class="small" style="margin-top: 4px;">Flash externally before debugging. This ELF still provides debug symbols.</div>
 			<div id="ppuFlashHexError" class="errorMsg" style="display:none;"></div>
 		</div>
 
@@ -562,10 +523,10 @@ function getHtml(defaults: AurixPanelDefaults): string {
 			<div class="groupTitle">CDSP (Converter Digital Signal Processor) - 12 cores</div>
 			${cdspRows}
 			<div class="checkbox" style="margin-top: 8px;">
-				<input type="checkbox" id="cdspFlashHex" ${cdspFlashHexChecked} />
-				<span>Flash Hex</span>
+				<input type="checkbox" id="cdspFlashHex" disabled />
+				<span>Flash Hex (unavailable)</span>
 			</div>
-			<div class="small" style="margin-top: 4px;">AurixFlasher will use the HEX file corresponding to the selected ELF for flashing. Please ensure the HEX file exists.</div>
+			<div class="small" style="margin-top: 4px;">Flash externally before debugging. These ELFs still provide debug symbols.</div>
 			<div id="cdspFlashHexError" class="errorMsg" style="display:none;"></div>
 		</div>
 
