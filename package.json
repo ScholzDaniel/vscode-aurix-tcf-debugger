@@ -276,13 +276,12 @@
                 "type": "string"
               },
               "enableFlashing": {
-                "description": "Unavailable: the bundled Flasher has been removed. Keep false and flash externally. A Windows/Linux replacement is planned.",
-                "enum": [false],
+                "description": "Run the bundled aurixflasher.exe with -elf <program> before starting the debug session. On failure, retry once with -erase all.",
                 "type": "boolean",
                 "default": false
               },
               "targetDevice": {
-                "description": "Target device name (must match lsmcdd.exe output; numeric ids are not supported). Used for agent -p.",
+                "description": "Target device name (must match lsmcdd.exe output; numeric ids are not supported). Used for agent -p and to resolve aurixflasher -id when enableFlashing is true.",
                 "type": "string"
               },
               "entryFunction": {
@@ -296,6 +295,16 @@
               "ppuElfPath": {
                 "description": "Path to the PPU ELF executable",
                 "type": "string"
+              },
+              "ppuFlashHex": {
+                "description": "When enableFlashing is true, also flash the .hex file beside the PPU ELF.",
+                "type": "boolean",
+                "default": false
+              },
+              "cdspFlashHex": {
+                "description": "When enableFlashing is true, also flash the .hex files beside the configured CDSP ELFs.",
+                "type": "boolean",
+                "default": false
               },
               "cdspElfPaths": {
                 "description": "List of CDSP ELF executables (12 cores)",

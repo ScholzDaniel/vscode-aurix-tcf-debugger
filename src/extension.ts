@@ -17,12 +17,14 @@ import { createGunzip } from 'zlib';
 import { showDebugConfigPanel } from './debugConfigPanel';
 import { LiveWatchProvider } from './liveWatchView';
 import { getSvdOptionsForDevice } from './svdCatalog';
-import { flashingUnavailableMessage, validateFlashingOptions } from './flashing';
+import { buildFlasherArgs, createFlashingPlan, selectFlasherDeviceId } from './flashing';
+import { resolveConfigPath } from './configPaths';
 
 let tcfAgentProcess: ChildProcess | undefined;
 let agentStopPromise: Promise<void> = Promise.resolve();
 let extensionContext: vscode.ExtensionContext;
 let agentOutput: vscode.OutputChannel | undefined;
+let flasherOutput: vscode.OutputChannel | undefined;
 let activeAurixSessions = 0;
 let startingAurixSessions = 0;
 let pendingStopTimer: NodeJS.Timeout | undefined;
@@ -50,6 +52,8 @@ export function activate(context: vscode.ExtensionContext) {
 	extensionContext = context;
 	console.log('Aurix TCF debugging extension is activating...');
 	agentOutput = vscode.window.createOutputChannel('AURIX TCF Agent');
+	flasherOutput = vscode.window.createOutputChannel('AURIX Flasher');
+	context.subscriptions.push(flasherOutput);
 	liveWatchProvider = new LiveWatchProvider(context);
 	context.subscriptions.push(liveWatchProvider);
 
@@ -353,9 +357,16 @@ export class AurixTCFDebugAdapterFactory implements vscode.DebugAdapterDescripto
 		const config = session.configuration;
 
 		try {
-			validateFlashingOptions(config);
+			const plan = createFlashingPlan(config, value => resolveConfigPathFromFolder(session.workspaceFolder, value));
+			if (plan) {
+				// Release the previous session's DAS connection before flashing on Restart.
+				await stopTCFAgent('pre-debug flashing');
+				await runAurixFlasher(plan.elfPath, typeof config.targetDevice === 'string' ? config.targetDevice : undefined, plan.hexFiles);
+			}
 		} catch (error) {
-			void vscode.window.showErrorMessage(flashingUnavailableMessage);
+			const message = error instanceof Error ? error.message : String(error);
+			flasherOutput?.appendLine(`Flashing failed: ${message}`);
+			void vscode.window.showErrorMessage(`Flashing failed: ${message}`);
 			throw error;
 		}
 
@@ -554,6 +565,51 @@ async function validateAgentTargetDevice(targetDevice: string): Promise<void> {
 	}
 }
 
+async function runAurixFlasher(elfPath: string, targetDevice: string | undefined, hexFiles: string[]): Promise<void> {
+	const flasherExe = path.join(extensionContext.extensionPath, 'bin', 'aurixflasher', 'aurixflasher.exe');
+	if (!fs.existsSync(flasherExe)) {
+		throw new Error(`aurixflasher.exe not found: ${flasherExe}`);
+	}
+	flasherOutput?.show(true);
+	flasherOutput?.appendLine(`Flashing ELF: ${elfPath}`);
+	for (const hex of hexFiles) {
+		flasherOutput?.appendLine(`Flashing HEX: ${hex}`);
+	}
+	flasherOutput?.appendLine(`Resolving device id via lsmcdd.exe (targetDevice='${targetDevice ?? ''}')...`);
+	const deviceId = selectFlasherDeviceId(await listLsmcddDevices(), targetDevice);
+	const args = buildFlasherArgs(elfPath, hexFiles, deviceId);
+
+	const run = (commandArgs: string[]): Promise<number> => {
+		flasherOutput?.appendLine(`Command: ${flasherExe} ${commandArgs.join(' ')}`);
+		return new Promise((resolve, reject) => {
+			execFile(flasherExe, commandArgs, {
+				cwd: path.dirname(flasherExe), windowsHide: true, maxBuffer: 20 * 1024 * 1024,
+			}, (error, stdout, stderr) => {
+				if (stdout) { flasherOutput?.appendLine(stdout.trimEnd()); }
+				if (stderr) { flasherOutput?.appendLine(stderr.trimEnd()); }
+				if (!error) {
+					resolve(0);
+				} else if (typeof error.code === 'number' && !error.killed && !error.signal) {
+					resolve(error.code);
+				} else {
+					reject(error);
+				}
+			});
+		});
+	};
+
+	let exitCode = await run(args);
+	if (exitCode !== 0) {
+		// Preserve the original Eclipse-compatible erase-and-retry behavior.
+		flasherOutput?.appendLine('Flashing failed, retrying with -erase all...');
+		exitCode = await run([...args, '-erase', 'all']);
+		if (exitCode !== 0) {
+			throw new Error(`Flashing failed even after erasing. Exit code: ${exitCode}`);
+		}
+	}
+	flasherOutput?.appendLine('Flashing completed successfully.');
+}
+
 function splitCommandLine(text: string): string[] {
 	// Simple quote-aware split for Additional Agent Options.
 	// Supports: foo bar "quoted arg" 'single quoted'.
@@ -622,20 +678,8 @@ function userProvidedAParameter(args: string[]): boolean {
 }
 
 function resolveConfigPathFromFolder(folder: vscode.WorkspaceFolder | undefined, p: unknown): string | undefined {
-	if (typeof p !== 'string' || p.trim() === '') {
-		return undefined;
-	}
-	let out = p;
 	const ws = folder?.uri.fsPath || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
-	if (ws) {
-		out = out.replaceAll('${workspaceFolder}', ws);
-		out = out.replaceAll('${workspaceRoot}', ws);
-	}
-	out = out.replace(/\//g, path.sep);
-	if (!path.isAbsolute(out) && ws) {
-		out = path.resolve(ws, out);
-	}
-	return out;
+	return resolveConfigPath(p, ws);
 }
 
 function getSvdCacheRoot(): string {

@@ -2,7 +2,7 @@
 
 > **Disclaimer:** This is a personal project, built and maintained by one developer in my own time. It is not an official Infineon product and has nothing to do with Infineon Technologies AG. It comes with no warranty and no promise of support or future updates. Use it at your own risk.
 
-This extension brings the TCF Debugger from [AURIX&trade; Configuration Studio](https://www.infineon.com/design-resources/platforms/aurix-software-tools/aurix-tools/aurix-configuration-studio) to VS Code. It talks to the TCF agent; the VS Code frontend (the debug adapter, UI, and views) is implemented here. The previously bundled AURIX Flasher has been removed.
+This extension brings the TCF Debugger from [AURIX&trade; Configuration Studio](https://www.infineon.com/design-resources/platforms/aurix-software-tools/aurix-tools/aurix-configuration-studio) to VS Code. It talks to the TCF agent; the VS Code frontend (the debug adapter, UI, and views) is implemented here. AURIX Flasher is bundled for optional pre-debug flashing and as a startup dependency of the TCF agent.
 
 VS Code extension for debugging Infineon AURIX&trade; devices. It supports all AURIX&trade; TC2x, TC3x, and TC4x microcontrollers, including their TriCore, PPU, and CDSP cores.
 
@@ -20,6 +20,7 @@ VS Code extension for debugging Infineon AURIX&trade; devices. It supports all A
 - Memory Inspector (read and write memeory)
 - Launch configuration with AURIX&trade; device detect button
 - Debug the PPU and CDSP cores
+- Optional pre-debug ELF flashing, including PPU/CDSP HEX files
 
 ## Requirements
 
@@ -33,16 +34,23 @@ VS Code extension for debugging Infineon AURIX&trade; devices. It supports all A
 The backend tools live under `bin/` and are bundled with this repository:
 
 - `aurix-debugger.exe` — the TCF agent
+- `aurixflasher/` — AURIX Flasher and its supporting files, required by the TCF agent at startup
 - `lsmcdd.exe`, `mcdxdas.dll` — DAS components
 - `svd/` — SVD files for the supported devices
 
-These tools come from [AURIX&trade; Configuration Studio](https://www.infineon.com/design-resources/platforms/aurix-software-tools/aurix-tools/aurix-configuration-studio) and are not covered by this project's MIT license. Their applicable licenses must be checked separately; the former Flasher license directory does not establish licensing for the remaining tools.
+Keep the complete `bin/aurixflasher/` directory beside `bin/aurix-debugger.exe` when packaging or deploying the extension, even for debug-only sessions. The extension starts the agent with its containing directory as the working directory.
+
+These tools come from [AURIX&trade; Configuration Studio](https://www.infineon.com/design-resources/platforms/aurix-software-tools/aurix-tools/aurix-configuration-studio) and are not covered by this project's MIT license. Their applicable licenses must be checked separately; the notices under `bin/aurixflasher/license/` do not establish licensing for the debugger, DAS components or SVD files.
 
 ### Flashing support
 
-The proprietary AURIX Flasher bundle is excluded from the current source tree and VSIX. Integrated pre-debug flashing, including PPU/CDSP **Flash Hex**, is unavailable. Flash the matching firmware with an external tool before debugging. Existing launch configurations with `enableFlashing`, `ppuFlashHex` or `cdspFlashHex` set to `true` are rejected explicitly; disable these options to debug firmware already on the target.
+Select **Enable flashing** in the configuration panel, or set `enableFlashing: true`, to flash `program` with the bundled AURIX Flasher before starting the debug session. This option defaults to `false`; leave it disabled to debug firmware already on the target.
 
-A replacement flasher with Windows/Linux support is planned. It is not integrated or validated for release yet, and this plan does not imply Linux support for the entire debugger. Existing debug, device-detection and ELF-symbol functionality is unchanged. This removal does not purge old Git history or previously published release assets.
+With **Enable flashing** selected, PPU/CDSP **Flash Hex** (`ppuFlashHex` / `cdspFlashHex`) adds the corresponding `.hex` files beside the configured ELFs to the same flasher invocation. Generate these HEX files before debugging; the extension does not convert them. Missing files stop launch with an explicit error. ELF files continue to provide debug symbols.
+
+The flasher resolves `targetDevice` through `lsmcdd.exe` and runs with `-gui off -elf <program> [-hex <file> ...] -start off -ver on -id <deviceId>`. If no device is configured, exactly one connected device is required. Output is shown in **AURIX Flasher**. **As in the original workflow, a failed flash retries once with `-erase all`, which may erase existing target flash contents.** If the retry fails, debugging does not start.
+
+Before flashing on Restart, the extension stops its previously owned agent to release the DAS connection. Externally managed agents are not stopped; release their target connection before using integrated flashing. The updated backend binaries and restored flashing workflow still require hardware validation.
 
 With `autoStartAgent=true`, each debug session (including VS Code Restart) starts a fresh agent after the previous owned process and port have closed. This prevents stale launch arguments and breakpoints from carrying into a new session. Externally managed agents (`autoStartAgent=false`) are not restarted by this policy.
 
