@@ -19,4 +19,3 @@ test-results/
 /scripts/test-tc375.ps1
 # Runtime log produced by the agent
 bin/AGENT_LOG.TXT
-/bin/aurixflasher/

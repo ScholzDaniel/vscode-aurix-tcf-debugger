@@ -10,12 +10,11 @@ and remain subject to their applicable licenses. They are owned by Infineon
 Technologies AG and third parties, not by this project. This notice does not
 grant redistribution rights.
 
-The previously bundled proprietary AURIX Flasher and its accompanying files
-have been removed from the current source tree and excluded from VSIX packaging.
-The former Flasher license directory did not establish licensing for the
-remaining debugger, DAS components or SVD files.
+The proprietary AURIX Flasher and its accompanying files are bundled under
+`bin/aurixflasher/` in the source tree and VSIX because the TCF agent invokes
+Flasher during startup, including debug-only sessions. The bundle also provides
+optional integrated pre-debug ELF and PPU/CDSP HEX flashing.
 
-A replacement flasher with Windows/Linux support is planned but not yet
-integrated. Its complete dependency and license requirements must be checked
-before distribution. Removing the old bundle from the current tree does not
-remove copies in earlier Git history or previously published releases.
+The accompanying notices are retained under `bin/aurixflasher/license/`.
+They do not establish licensing for the debugger, DAS components or SVD files.
+Check the applicable terms for the complete bundle before redistribution.

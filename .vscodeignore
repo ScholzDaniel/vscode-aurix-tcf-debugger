@@ -13,7 +13,6 @@ test-results/**
 **/*.local.json
 docs/
 *.vsix
-bin/aurixflasher/**
 bin/llvm-dwarfdump.exe
 ACS_TEST_MAP.md
 TESTING.md

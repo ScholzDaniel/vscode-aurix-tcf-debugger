@@ -7,7 +7,8 @@ import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getSvdOptionsForDevice } from './svdCatalog';
-import { flashingUnavailableMessage, validateFlashingOptions } from './flashing';
+import { collectFlashHexFiles } from './flashing';
+import { resolveConfigPath } from './configPaths';
 
 function esc(s: string): string {
 	return s
@@ -162,14 +163,16 @@ export async function showDebugConfigPanel(context: vscode.ExtensionContext): Pr
 			// Save last-used values so reopening the panel keeps them.
 			await savePanelValues(context, msg.config);
 
+			const folder = vscode.workspace.workspaceFolders?.[0];
 			try {
-				validateFlashingOptions(msg.config);
-			} catch {
-				void vscode.window.showErrorMessage(flashingUnavailableMessage);
+				collectFlashHexFiles(msg.config, value => resolveConfigPath(value, folder?.uri.fsPath));
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				void panel.webview.postMessage({ type: 'flashHexValidationErrors', errors: message.split('\n') });
+				void vscode.window.showErrorMessage(`Flash Hex validation failed: ${message}`);
 				return;
 			}
 
-			const folder = vscode.workspace.workspaceFolders?.[0];
 			await vscode.debug.startDebugging(folder, msg.config as vscode.DebugConfiguration);
 		}
 	}, undefined, context.subscriptions);
@@ -296,6 +299,9 @@ function getHtml(defaults: AurixPanelDefaults): string {
 	const ppuElfValue = esc(defaults.values.ppuElfPath || '');
 	const scrElfValue = esc(defaults.values.scrElfPath || '');
 	const cdspElfValues = Array.isArray(defaults.values.cdspElfPaths) ? defaults.values.cdspElfPaths : new Array(12).fill('');
+	const enableFlashingChecked = defaults.values.enableFlashing ? 'checked' : '';
+	const ppuFlashHexChecked = defaults.values.ppuFlashHex ? 'checked' : '';
+	const cdspFlashHexChecked = defaults.values.cdspFlashHex ? 'checked' : '';
 	const entryFunctionValue = esc(defaults.values.entryFunction || '');
 	const targetDeviceValue = esc(defaults.values.targetDevice || '');
 	const svdValue = esc(defaults.values.svdFile || '');
@@ -466,9 +472,9 @@ function getHtml(defaults: AurixPanelDefaults): string {
 
 			<label for="program">Debug binary</label>
 			<div class="inlineRow">
-				<div class="checkbox" title="Integrated flashing is unavailable; flash the matching firmware externally.">
-					<input type="checkbox" id="enableFlashing" disabled />
-					<span class="small">Flashing unavailable</span>
+				<div class="checkbox" title="Runs aurixflasher.exe before starting the debug session">
+					<input type="checkbox" id="enableFlashing" ${enableFlashingChecked} />
+					<span class="small">Enable flashing</span>
 				</div>
 				<input id="program" placeholder="C:\\path\\to\\program.elf" value="${programValue}" />
 				<button type="button" class="browseElf" data-key="program">Browse...</button>
@@ -500,7 +506,6 @@ function getHtml(defaults: AurixPanelDefaults): string {
 				<span class="small">Show TCF protocol messages in the debug console</span>
 			</div>
 		</div>
-		<div class="small">The bundled Flasher has been removed. Flash the matching firmware externally before debugging. Saved flashing selections are disabled in this panel. A replacement with Windows/Linux support is planned, not yet available.</div>
 	</div>
 
 	<div class="tab" id="tab-cores">
@@ -512,10 +517,10 @@ function getHtml(defaults: AurixPanelDefaults): string {
 				<button type="button" class="browseElf" data-key="ppuElfPath">Browse...</button>
 			</div>
 			<div class="checkbox" style="margin-top: 8px;">
-				<input type="checkbox" id="ppuFlashHex" disabled />
-				<span>Flash Hex (unavailable)</span>
+				<input type="checkbox" id="ppuFlashHex" ${ppuFlashHexChecked} />
+				<span>Flash Hex</span>
 			</div>
-			<div class="small" style="margin-top: 4px;">Flash externally before debugging. This ELF still provides debug symbols.</div>
+			<div class="small" style="margin-top: 4px;">With Enable flashing selected, AurixFlasher also flashes the HEX file corresponding to this ELF. Please ensure the HEX file exists.</div>
 			<div id="ppuFlashHexError" class="errorMsg" style="display:none;"></div>
 		</div>
 
@@ -523,10 +528,10 @@ function getHtml(defaults: AurixPanelDefaults): string {
 			<div class="groupTitle">CDSP (Converter Digital Signal Processor) - 12 cores</div>
 			${cdspRows}
 			<div class="checkbox" style="margin-top: 8px;">
-				<input type="checkbox" id="cdspFlashHex" disabled />
-				<span>Flash Hex (unavailable)</span>
+				<input type="checkbox" id="cdspFlashHex" ${cdspFlashHexChecked} />
+				<span>Flash Hex</span>
 			</div>
-			<div class="small" style="margin-top: 4px;">Flash externally before debugging. These ELFs still provide debug symbols.</div>
+			<div class="small" style="margin-top: 4px;">With Enable flashing selected, AurixFlasher also flashes the HEX files corresponding to these ELFs. Please ensure the HEX files exist.</div>
 			<div id="cdspFlashHexError" class="errorMsg" style="display:none;"></div>
 		</div>
 
