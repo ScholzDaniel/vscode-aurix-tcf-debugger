@@ -165,3 +165,22 @@ export async function getSvdOptionsForDevice(extensionPath: string, targetDevice
 	void targetDevice;
 	return entries.map((entry) => ({ label: entry.label, value: entry.absolutePath }));
 }
+
+export function svdDeviceFamilies(targetDevice: string): Set<string> {
+	return new Set(Array.from(targetDevice.matchAll(/\bTC([234][0-9A-Z])[0-9A-Z]\b/gi),
+		match => `TC${match[1].toUpperCase()}X`));
+}
+
+export async function getAutomaticSvd(extensionPath: string, targetDevice: string): Promise<string | undefined> {
+	// DAS model identifiers, not board marketing names. Prefer the standard, non-EXT definition.
+	const families = svdDeviceFamilies(targetDevice);
+	if (families.size !== 1) { return undefined; }
+	const catalogIds: Record<string, string> = {
+		TC22X: 'TC22XPD', TC23X: 'TC23XPD', TC26X: 'TC26XBPD', TC27X: 'TC27XDPD', TC29X: 'TC29XBPD',
+		TC33X: 'TC33XPD', TC35X: 'TC35XPD', TC36X: 'TC36XPD', TC37X: 'TC37XPD', TC38X: 'TC38XPD', TC39X: 'TC39XBPD',
+		TC4DX: 'TC4DXAPD',
+	};
+	const id = catalogIds[Array.from(families)[0]];
+	const matches = (await getSvdCatalogEntries(extensionPath)).filter(entry => entry.id === id);
+	return matches.length === 1 ? matches[0].absolutePath : undefined;
+}

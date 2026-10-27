@@ -571,7 +571,7 @@ export abstract class AbstractTCFClient {
         //fail all pending commands
         Object.keys(this.asyncSends).forEach(k => {
             const pr = this.deleteAsync(k);
-            pr?.error(new TimeoutError("disconected"));
+            pr?.error(new TimeoutError("disconnected"));
         });
     }
 

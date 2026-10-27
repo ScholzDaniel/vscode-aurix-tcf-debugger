@@ -19,6 +19,17 @@ abstract class SymbolsCommand<T> extends ValidatingCommand<T> {
     }
 }
 
+export class FindByNameSymbolsCommand extends SymbolsCommand<string[] | null> {
+    constructor(readonly contextID: string, readonly name: string) { super(); }
+    command(): string { return "findByName"; }
+    arguments() { return undefined; }
+    override toBuffer(token: string): Buffer {
+        // IP zero searches global symbol tables rather than the current frame's lexical scope.
+        return toBuffer(["C", token, this.service(), this.command(), JSON.stringify(this.contextID), "0", JSON.stringify(this.name)]);
+    }
+    override cast(json: unknown): string[] | null { return asStringNullableArray(json); }
+}
+
 //returns string
 export class FindByAddrSymbolsCommand extends SymbolsCommand<string> {
     contextID: string;

@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import type { DasDevice } from './deviceDiscovery';
 
 type ResolvePath = (value: unknown) => string | undefined;
 
@@ -70,18 +71,22 @@ export function createFlashingPlan(
 	return { elfPath, hexFiles };
 }
 
-export function buildFlasherArgs(elfPath: string, hexFiles: readonly string[], deviceId: string): string[] {
+export function buildFlasherArgs(elfPath: string, hexFiles: readonly string[], device: Readonly<DasDevice>): string[] {
 	const args = ['-gui', 'off', '-elf', elfPath];
 	for (const hex of hexFiles) {
 		args.push('-hex', hex);
 	}
-	return [...args, '-start', 'off', '-ver', 'on', '-id', deviceId];
+	args.push('-start', 'off');
+	if (/^TC[34]/i.test(device.family)) {
+		args.push('-freq', '20000000');
+	}
+	return [...args, '-id', device.id];
 }
 
-export function selectFlasherDeviceId(
-	devices: readonly { id: string; name: string; family: string }[],
+export function selectFlasherDevice(
+	devices: readonly Readonly<DasDevice>[],
 	device: string | undefined,
-): string {
+): Readonly<DasDevice> {
 	const raw = (device ?? '').trim();
 	if (/^\d+$/.test(raw)) {
 		throw new Error('targetDevice must be a device name (not a numeric id).');
@@ -90,7 +95,7 @@ export function selectFlasherDeviceId(
 		throw new Error('No devices detected by lsmcdd.exe');
 	}
 	if (raw === '' && devices.length === 1) {
-		return devices[0].id;
+		return devices[0];
 	}
 	const names = devices.map(d => d.name).join('; ');
 	if (raw === '') {
@@ -99,11 +104,11 @@ export function selectFlasherDeviceId(
 	const lower = raw.toLowerCase();
 	const exact = devices.find(d => d.name === raw) ?? devices.find(d => d.name.toLowerCase() === lower);
 	if (exact) {
-		return exact.id;
+		return exact;
 	}
 	const families = devices.filter(d => d.family.toLowerCase() === lower);
 	if (families.length === 1) {
-		return families[0].id;
+		return families[0];
 	}
 	if (families.length > 1) {
 		throw new Error(`Device '${raw}' matches multiple devices (by family). Matches: ${families.map(d => d.name).join('; ')}`);

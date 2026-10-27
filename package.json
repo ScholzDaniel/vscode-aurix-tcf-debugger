@@ -4,7 +4,7 @@
   "displayName": "AURIX™ TCF Debugger",
   "icon": "media/debugger-icon.png",
   "publisher": "zehuazhang",
-  "version": "0.1.0",
+  "version": "0.1.28",
   "repository": {
     "type": "git",
     "url": "https://github.com/ZeZhan/vscode-aurix-tcf-debugger.git"
@@ -15,7 +15,7 @@
   },
   "license": "MIT",
   "engines": {
-    "vscode": "^1.79.0"
+    "vscode": "^1.102.0"
   },
   "categories": [
     "Debuggers"
@@ -54,7 +54,8 @@
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
     "test": "node ./out/test/runTest.js",
-    "test:unit": "npm run compile && mocha --ui tdd ./out/test/suite/dapEvents.test.js ./out/test/suite/hardwareProfile.test.js ./out/test/suite/threadCache.test.js ./out/test/suite/stepOutStop.test.js ./out/test/suite/expressionValues.test.js ./out/test/suite/instructionControl.test.js ./out/test/suite/breakpointStopBarrier.test.js ./out/test/suite/stopFocusEvents.test.js ./out/test/suite/flashing.test.js",
+    "test:unit": "npm run compile && mocha --ui tdd ./out/test/suite/dapEvents.test.js ./out/test/suite/hardwareProfile.test.js ./out/test/suite/threadCache.test.js ./out/test/suite/stepOutStop.test.js ./out/test/suite/expressionValues.test.js ./out/test/suite/instructionControl.test.js ./out/test/suite/breakpointStopBarrier.test.js ./out/test/suite/stopFocusEvents.test.js ./out/test/suite/flashing.test.js ./out/test/suite/panelLaunchConfiguration.test.js ./out/test/suite/debugSkill.test.js ./out/test/suite/debugMcp.test.js ./out/test/suite/debugMcpHttp.test.js ./out/test/suite/debugMcpLifecycle.test.js ./out/test/suite/debugMcpRegistration.test.js ./out/test/suite/debugMcpInspection.test.js ./out/test/suite/debugMcpObservation.test.js ./out/test/suite/breakpointInspection.test.js ./out/test/suite/memoryPeripheralInspection.test.js ./out/test/suite/debugMcpPeripheralWrite.test.js ./out/test/suite/globalInspection.test.js ./out/test/suite/debugMcpPrepare.test.js",
+    "test:mcp": "npm run compile && mocha --ui tdd ./out/test/suite/debugMcp.test.js ./out/test/suite/debugMcpHttp.test.js ./out/test/suite/debugMcpLifecycle.test.js ./out/test/suite/debugMcpRegistration.test.js ./out/test/suite/debugMcpInspection.test.js ./out/test/suite/debugMcpObservation.test.js ./out/test/suite/breakpointInspection.test.js ./out/test/suite/memoryPeripheralInspection.test.js ./out/test/suite/debugMcpPeripheralWrite.test.js ./out/test/suite/globalInspection.test.js ./out/test/suite/debugMcpPrepare.test.js",
     "test:preflight": "tsc -p ./ && node ./out/test/runTest.js --preflight",
     "test:hardware": "pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/run-test.ps1 -Hardware",
     "test:tc375": "pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-tc375.ps1",
@@ -62,9 +63,11 @@
     "package": "npx vsce package --no-rewrite-relative-links -o vscode-aurix-tcf-debug.vsix"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "2.3.1",
     "@types/mocha": "^10.0.6",
     "@types/node": "20.x",
-    "@types/vscode": "^1.79.0",
+    "@types/sax": "1.2.7",
+    "@types/vscode": "1.102.0",
     "@typescript-eslint/eslint-plugin": "^6.13.2",
     "@typescript-eslint/parser": "^6.13.2",
     "@vscode/test-electron": "^2.3.8",
@@ -75,14 +78,34 @@
     "typescript": "^5.3.3"
   },
   "dependencies": {
+    "@modelcontextprotocol/node": "2.1.1",
+    "@modelcontextprotocol/server": "2.3.1",
     "@vscode/debugadapter": "1.64.0",
-    "@vscode/debugprotocol": "1.64.0"
+    "@vscode/debugprotocol": "1.64.0",
+    "sax": "1.6.1",
+    "zod": "4.6.7"
   },
   "contributes": {
+    "configurationDefaults": {
+      "mcu-debug.peripheral-viewer.svdAddrGapThreshold": 0,
+      "mcu-debug.peripheral-viewer.alignment": 0,
+      "mcu-debug.peripheral-viewer.maxReadSize": 128
+    },
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "aurix-tcf.debugMcp",
+        "label": "AURIX Debug MCP"
+      }
+    ],
     "commands": [
       {
         "command": "aurix-tcf.openDebugConfig",
         "title": "Open Debug Configuration",
+        "category": "AURIX™ TCF"
+      },
+      {
+        "command": "aurix-tcf.installDebugSkill",
+        "title": "Install / Update Debug Skill",
         "category": "AURIX™ TCF"
       },
       {
@@ -219,6 +242,23 @@
     "configuration": {
       "title": "AURIX™ TCF Debugger",
       "properties": {
+        "aurix-tcf.mcp.enabled": {
+          "type": "boolean",
+          "default": true,
+          "scope": "window",
+          "markdownDescription": "Automatically provide AURIX Debug MCP in trusted local Windows workspaces (enabled by default). The authenticated loopback endpoint starts on discovery; this does not launch debugging, connect to hardware, build or flash. No MCP configuration file is required. Explicitly disable to opt out; VS Code MCP trust and tool approvals still apply. Shared UI sessions, bounded inspection and no-flash debug_start are supported."
+        },
+        "aurix-tcf.peripheralReadProfile": {
+          "type": "string",
+          "enum": [
+            "disabled",
+            "tc375-gtm-atom0-ch4"
+          ],
+          "default": "disabled",
+          "scope": "resource",
+          "deprecationMessage": "No longer used. Remove this workspace setting. Launch peripheralReadProfile controls MCP peripheral access only; auto uses the full SVD with individually approved writes.",
+          "markdownDescription": "Deprecated compatibility setting; ignored. No workspace setting is required for peripheral inspection."
+        },
         "aurix-tcf.executePathMapper": {
           "type": "boolean",
           "default": true,
@@ -289,8 +329,18 @@
                 "type": "string"
               },
               "svdFile": {
-                "description": "Path to SVD (System View Description) file for register definitions. Supports ${command:aurix-tcf.pickSvd}.",
+                "description": "Optional source SVD. If omitted, match the DAS model to a bundled standard SVD. Agent, manual Viewer and auto-mode MCP share the full definition and original permissions. Every MCP peripheral write requires explicit user approval. Supports ${command:aurix-tcf.pickSvd}.",
                 "type": "string"
+              },
+              "peripheralReadProfile": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "disabled",
+                  "tc375-gtm-atom0-ch4"
+                ],
+                "default": "auto",
+                "description": "MCP-only peripheral policy. auto/default shares the full matching SVD and native access with the manual Viewer; each write requires explicit user approval. disabled blocks MCP peripheral access; explicit legacy TC375 channel4 remains read-only. Does not restrict manual Viewer display/read/write or change a running session."
               },
               "ppuElfPath": {
                 "description": "Path to the PPU ELF executable",

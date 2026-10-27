@@ -19,6 +19,9 @@ import { asArray, asNullableArray, asString, asStringArray, CancellationFunction
 import { DefaultVariableHelper } from "./variables/helper";
 import { SymbolRawValueProvider } from "./variables/symbol";
 import { ClientVariable, FixedNameProvider, RawValueProvider, SymbolNameProvider } from "./variables/types";
+import { InspectionCheck, InspectionVariableHelper, validateVariableSize } from "./variables/inspection";
+import { LocalInspectionError } from "./variables/inspectionDiagnostics";
+import { CoreRegisterReader } from "./coreRegisters";
 import * as validateBreakpointData from './tcf/validators/validate-BreakpointData';
 
 class EvaluatedRawValueProvider implements RawValueProvider {
@@ -167,7 +170,7 @@ export abstract class TCFClient extends AbstractTCFClient {
         return result;
     }
 
-    private async evaluateVariable(varName: string): Promise<EvaluateResult | undefined> {
+    private async evaluateVariable(varName: string, strict = false): Promise<EvaluateResult | undefined> {
         let value;
         try {
             value = await this.sendCommand(new EvaluateExpressionsCommand(varName));
@@ -177,7 +180,7 @@ export abstract class TCFClient extends AbstractTCFClient {
                 //Such partial data was seen:
                 // {"result":{"value":{"type":"Buffer","data":[110,117,108,108]},"properties":null}}
                 //thus, ignoring partial results without .properties
-                if (partial.result.properties !== null) {
+                if (!strict && partial.result.properties !== null) {
                     value = partial.result;
                     //TODO: besides the (partial) value, we should also signal in the final result that *it is a partial value*
                     // then the UI could display it differently
@@ -192,20 +195,82 @@ export abstract class TCFClient extends AbstractTCFClient {
         return value;
     }
 
-    async getExpressionIDVariable(ctx: string, stack: string, varName: string, displayName?: string): Promise<ClientVariable | undefined> {
-        const evaluated = await this.evaluateVariable(varName);
+    async getExpressionIDVariable(ctx: string, stack: string, varName: string, displayName?: string, inspection?: InspectionCheck): Promise<ClientVariable | undefined> {
+        let inspectedSize: number | undefined;
+        let inspectedSymbol: TCFSymbolContextData | undefined;
+        if (inspection) {
+            inspection();
+            const metadata = await this.sendCommand(new GetContextExpressionsCommand(varName));
+            inspection();
+            const unavailable = (code: string, message: string, symbol?: TCFSymbolContextData) =>
+                new LocalInspectionError(code, message, ctx, stack, varName, metadata, symbol);
+            if (!metadata) {
+                throw unavailable('LOCAL_CONTEXT_MISSING', 'Expressions.getContext returned no local metadata.');
+            }
+            if (metadata.ID !== varName) {
+                throw unavailable('LOCAL_CONTEXT_ID_MISMATCH', 'Local expression ID does not match the requested discovered local.');
+            }
+            if (metadata.HasFuncCall === true) {
+                throw unavailable('LOCAL_FUNCTION_CALL', 'Local metadata reports a function call; evaluation is blocked.');
+            }
+            if (!metadata.SymbolID) {
+                throw unavailable('LOCAL_SYMBOL_MISSING', 'Local expression metadata has no SymbolID; storage safety cannot be checked.');
+            }
+            if (metadata.ParentID !== undefined && metadata.ParentID !== stack && metadata.ParentID !== ctx) {
+                throw unavailable('LOCAL_PARENT_MISMATCH', 'Local expression ParentID is neither the requested stack nor the selected core.');
+            }
+            // TCF ${ID} denotes a symbol, not a user-supplied expression or VS Code substitution.
+            const directSymbol = metadata.Expression === '${' + metadata.SymbolID + '}' &&
+                !/[{}\x00-\x1f\x7f]/.test(metadata.SymbolID);
+            if (metadata.Expression !== undefined && !/^[A-Za-z_]\w*$/.test(metadata.Expression) && !directSymbol) {
+                throw unavailable('LOCAL_EXPRESSION_UNSUPPORTED', 'Local Expression is neither a plain identifier nor an exact ${SymbolID} reference; evaluation is blocked.');
+            }
+            try { inspectedSize = validateVariableSize(metadata.Size); }
+            catch (error) { throw unavailable('LOCAL_SIZE_UNSUPPORTED', error instanceof Error ? error.message : String(error)); }
+            const symbol = await this.sendCommand(new GetContextSymbolsCommand(metadata.SymbolID));
+            inspection();
+            if (symbol.ID !== metadata.SymbolID) {
+                throw unavailable('LOCAL_SYMBOL_ID_MISMATCH', 'Local symbol identity does not match expression metadata.', symbol);
+            }
+            if (symbol.Size !== undefined && symbol.Size !== inspectedSize) {
+                throw unavailable('LOCAL_SYMBOL_SIZE_MISMATCH', 'Local symbol size does not match expression metadata.', symbol);
+            }
+            if (symbol.Class !== TCFSymbolClass.reference && symbol.Class !== TCFSymbolClass.value) {
+                throw unavailable('LOCAL_SYMBOL_CLASS_UNSUPPORTED', 'MCP locals must identify a value or storage symbol.', symbol);
+            }
+            inspectedSymbol = symbol;
+            if (symbol.Address !== undefined && (!Number.isSafeInteger(symbol.Address) || symbol.Address < 0 ||
+                symbol.Address + inspectedSize > 0xf0000000)) {
+                throw unavailable('LOCAL_ADDRESS_UNSAFE', 'Peripheral/SFR or invalid variable address is not readable through MCP.', symbol);
+            }
+            if (symbol.Address === undefined && symbol.Value === undefined && symbol.Register === undefined) {
+                throw unavailable('LOCAL_LOCATION_UNKNOWN', 'Local storage location is unavailable; read safety cannot be checked.', symbol);
+            }
+            if (symbol.Register !== undefined) {
+                const registers = await new CoreRegisterReader(c => this.sendCommand(c)).list(ctx, inspection);
+                if (!registers.some(register => register.id === symbol.Register && register.allowed)) {
+                    throw unavailable('LOCAL_REGISTER_UNSAFE', 'Local register storage is not an allowed CORE register.', symbol);
+                }
+            }
+        }
+        inspection?.();
+        const evaluated = await this.evaluateVariable(varName, inspection !== undefined);
+        inspection?.();
         if (!evaluated?.properties) {
             throw new Error(`Cannot display expression ${displayName || varName}: missing value properties`);
         }
         const expressionContext = evaluated.properties.Type ? undefined :
             await this.sendCommand(new GetContextExpressionsCommand(varName));
         const typeID = evaluated.properties.Type || expressionContext?.Type;
-        const symbolID = evaluated.properties.Symbol;
+        if (inspection && evaluated.properties.Symbol && evaluated.properties.Symbol !== inspectedSymbol?.ID) {
+            throw new Error('Evaluated local symbol changed during inspection.');
+        }
+        const symbolID = evaluated.properties.Symbol ?? inspectedSymbol?.ID;
 
         this.console.received(`Value ${varName} ${JSON.stringify(evaluated.properties)}`);
 
         const self = this;
-        const helper = new class extends DefaultVariableHelper {
+        const helper = inspection ? new InspectionVariableHelper(c => self.sendCommand(c), inspection) : new class extends DefaultVariableHelper {
             log(message: string): void {
                 self.console.log(message);
             }
@@ -241,10 +306,10 @@ export abstract class TCFClient extends AbstractTCFClient {
             evaluated.value, evaluated.properties.BigEndian ?? false, expressionContext?.Size ?? typeDetails.Size);
 
         if (symbolID) {
-            symbolDetails = await this.sendCommand(new GetContextSymbolsCommand(symbolID));
+            symbolDetails = inspectedSymbol ?? await this.sendCommand(new GetContextSymbolsCommand(symbolID));
             this.console.received(`Got variable ${symbolDetails.Name}`);
             nameProvider = new SymbolNameProvider(symbolDetails);
-            valueProvider = new SymbolRawValueProvider(symbolDetails, ctx, helper, helper /* as Logger */);
+            if (!inspection) { valueProvider = new SymbolRawValueProvider(symbolDetails, ctx, helper, helper /* as Logger */); }
 
             if (typeDetails.TypeClass !== symbolDetails.TypeClass) {
                 //shouldn't happen?
@@ -262,6 +327,17 @@ export abstract class TCFClient extends AbstractTCFClient {
             }
         }
 
+        if (inspection) {
+            inspection();
+            const bytes = decodeEvaluatedValue(evaluated.value, inspectedSize);
+            if (bytes.length !== inspectedSize || (typeDetails.Size !== undefined && typeDetails.Size !== inspectedSize) ||
+                evaluated.properties.ImplicitPointer || evaluated.properties.Pieces?.length ||
+                evaluated.properties.BitStride || evaluated.properties.BinaryScale || evaluated.properties.DecimalScale) {
+                throw new Error('Local value is incomplete or uses an unsupported layout.');
+            }
+            // Expansion retains this captured value, never SymbolRawValueProvider's implicit Memory.get.
+            valueProvider = { value: async () => bytes, isBigEndian: () => evaluated.properties?.BigEndian === true };
+        }
         return helper.createVariable(typeDetails, symbolDetails, nameProvider, valueProvider);
     }
 

@@ -53,6 +53,26 @@ import { GetStatusBreakpointsCommand } from './tcf/breakpoints';
 import { isStepOutReturnStop, StepOutTarget } from './stepOutStop';
 import { disassemblyWindow } from './disassemblyWindow';
 import { BreakpointStopBarrier } from './breakpointStopBarrier';
+import { z } from 'zod';
+import { CoreRegisterReader } from './coreRegisters';
+import { BreakpointInspector, targetAddress } from './breakpointInspection';
+import { InspectedVariable } from './variables/inspection';
+import { LocalInspectionError } from './variables/inspectionDiagnostics';
+import { GetChildrenExpressionCommand } from './tcf/expressions';
+import { AddressRange, elfLoadRanges, memoryReadSchema, readableElfRanges, readInspectedMemory } from './memoryInspection';
+import { PeripheralProfile, peripheralProfileName, preparedPeripheralProfile, preparedPeripheralCatalog } from './peripheralProfile';
+import { NativePeripheralAccess, NativePeripheralWrite } from './nativePeripheralAccess';
+import { FullPeripheralReader, PeripheralRegisterReader, peripheralPageSchema } from './peripheralInspection';
+import { randomUUID } from 'crypto';
+import { GlobalSelection, GlobalVariableInspector, globalLookupSchema } from './variables/globals';
+
+const inspectionOptionsSchema = z.object({
+	threadId: z.number().int().positive(), epoch: z.number().int().nonnegative(),
+	expiresAt: z.number().int().positive(),
+}).strict();
+const inspectionPageSchema = z.object({
+	start: z.number().int().min(0).max(1000000), count: z.number().int().min(1).max(100),
+});
 
 export interface InternalLaunchArguments {
 	debugTCFMessages?: boolean;
@@ -82,6 +102,8 @@ export interface AurixTCFLaunchRequestArguments extends DebugProtocol.LaunchRequ
 	core?: number;
 	entryFunction?: string;
 	svdFile?: string;
+	peripheralReadProfile?: 'auto' | 'disabled' | typeof peripheralProfileName;
+	__aurixPeripheralNotice?: string;
 	workspace?: string;
 	flashDownload?: boolean;
 	globalAccess?: boolean;
@@ -291,7 +313,171 @@ class InstructionBreakpointsManager {
 	}
 }
 
+class InspectionStateChangedError extends Error {
+	constructor(readonly previousEpoch: number, readonly currentEpoch: number, readonly reason: string) {
+		super('Inspection references expired after an execution change.');
+	}
+}
+
 export class AurixTCFDebugSession extends LifetimeDebugSession {
+	private disconnecting = false;
+	private memoryDisconnectReported = false;
+	private inspectionEpoch = 0;
+	private inspectionChangeReason = 'initial state';
+	private lastPeripheralCancellationEpoch = -1;
+	private inspectionReference = 0;
+	private readonly inspectionVariables = new Map<number, { contextId: string; stack?: string; variable?: InspectedVariable }>();
+	private readonly inspectionGlobals = new Map<number, GlobalSelection>();
+	private inspectionMemoryRanges?: AddressRange[];
+	private inspectionPeripheralProfile?: PeripheralProfile;
+	private nativePeripherals?: NativePeripheralAccess;
+	private peripheralWritesInFlight = 0;
+	private mcpPeripheralMode: 'full' | 'legacy' | 'disabled' = 'legacy';
+	private readonly peripheralWriteTickets = new Map<string, {
+		plan: NativePeripheralWrite; access: NativePeripheralAccess; threadId: number; epoch: number;
+		expiresAt: number; consumed: boolean; cancelled: boolean;
+	}>();
+	private peripheralNotice = 'Peripheral reads are disabled or unavailable for this session; select a matching SVD and relaunch.';
+
+	private async peripheralReader(): Promise<PeripheralRegisterReader | FullPeripheralReader> {
+		if (this.mcpPeripheralMode === 'disabled') { throw new Error('MCP peripheral access is disabled for this session.'); }
+		if (this.mcpPeripheralMode === 'full' && this.nativePeripherals) { return new FullPeripheralReader(this.nativePeripherals); }
+		if (!this.inspectionPeripheralProfile) {
+			throw new Error(`${this.peripheralNotice} No Memory.get fallback is allowed.`);
+		}
+		return new PeripheralRegisterReader(command => this.tcfClient.sendCommand(command), this.inspectionPeripheralProfile, this.nativePeripherals);
+	}
+
+	protected override dispatchRequest(request: DebugProtocol.Request): void {
+		if (/^(continue|next|stepIn|stepOut|pause|restart|disconnect|terminate|setVariable|setExpression|writeMemory|aurix-tcf\/(reset|halt))$/.test(request.command)) {
+			this.invalidateInspection(`DAP ${request.command}`);
+		}
+		super.dispatchRequest(request);
+	}
+
+	private invalidateInspection(reason: string): void {
+		this.inspectionEpoch++;
+		this.inspectionChangeReason = reason;
+		this.inspectionVariables.clear();
+		this.inspectionGlobals.clear();
+		this.nativePeripherals?.invalidate();
+		for (const ticket of this.peripheralWriteTickets.values()) { ticket.cancelled = true; }
+		this.peripheralWriteTickets.clear();
+	}
+
+	private checkNotDisconnecting(): void {
+		if (this.disconnecting) { throw new Error('Debug session is disconnecting.'); }
+	}
+
+	private async viewerContext(contextId: string) {
+		const epoch = this.inspectionEpoch, expiresAt = Date.now() + 15000;
+		let phase: 'state' | 'metadata' | 'values' = 'state';
+		const check = (currentPhase?: typeof phase) => {
+			phase = currentPhase ?? phase;
+			this.checkNotDisconnecting();
+			if (epoch !== this.inspectionEpoch) { throw new InspectionStateChangedError(epoch, this.inspectionEpoch, this.inspectionChangeReason); }
+			if (Date.now() >= expiresAt) { throw new Error(`Peripheral Viewer request deadline exceeded (phase: ${phase}; limit: 15000 ms).`); }
+		};
+		const verify = async () => {
+			check('state');
+			const threads = await this.tcfClient.getThreads(true);
+			check('state');
+			if (!threads.some(thread => thread.info.ID === contextId && thread.state.suspended)) {
+				throw new Error('Peripheral Viewer requires the selected core to be stopped.');
+			}
+		};
+		await verify();
+		return { check, verify };
+	}
+
+	private async inspectionContext(raw: unknown, ownPeripheralWrite = false) {
+		const options = inspectionOptionsSchema.parse(raw);
+		const check = () => {
+			this.checkNotDisconnecting();
+			if (this.peripheralWritesInFlight > (ownPeripheralWrite ? 1 : 0)) { throw new Error('Inspection unavailable while a manual peripheral write is in progress.'); }
+			if (options.epoch !== this.inspectionEpoch) {
+				throw new InspectionStateChangedError(options.epoch, this.inspectionEpoch, this.inspectionChangeReason);
+			}
+			if (Date.now() >= options.expiresAt || options.expiresAt > Date.now() + 15000) { throw new Error('Inspection deadline expired or invalid.'); }
+		};
+		check();
+		const contextId = this.threadIdToContext.get(options.threadId);
+		const threads = await this.tcfClient.getThreads(true);
+		check();
+		if (!contextId || !threads.some(thread => thread.info.ID === contextId && thread.state.suspended) ||
+			threads.some(thread => !thread.state.suspended)) { throw new Error('Inspection requires all reported cores stopped and an explicit valid thread.'); }
+		return { contextId, check };
+	}
+
+	private storeInspectionVariable(value: { contextId: string; stack?: string; variable?: InspectedVariable }): number {
+		if (this.inspectionVariables.size >= 4096) { throw new Error('MCP variable reference limit reached; execution invalidates the old references.'); }
+		const reference = ++this.inspectionReference;
+		this.inspectionVariables.set(reference, value);
+		return reference;
+	}
+
+	private async inspectionScopes(response: DebugProtocol.ScopesResponse, raw: unknown): Promise<void> {
+		const args = z.object({ frameId: z.number().int().nonnegative(), aurixMcp: inspectionOptionsSchema }).parse(raw);
+		const { contextId, check } = await this.inspectionContext(args.aurixMcp);
+		const [frameContext, stack] = this.getStackFrameDetails(this.getLocalScopeVariableReference(args.frameId));
+		if (contextId !== frameContext) { throw new Error('Frame belongs to a different core or is stale.'); }
+		check();
+		const reference = this.storeInspectionVariable({ contextId, stack });
+		response.body = { scopes: [new Scope('Locals', reference, false)] };
+		this.sendResponse(response);
+	}
+
+	private async inspectionVariablePage(response: DebugProtocol.VariablesResponse, raw: unknown): Promise<void> {
+		const args = inspectionPageSchema.extend({
+			variablesReference: z.number().int().positive(), aurixMcp: inspectionOptionsSchema,
+		}).parse(raw);
+		const { contextId, check } = await this.inspectionContext(args.aurixMcp);
+		const reference = this.inspectionVariables.get(args.variablesReference);
+		if (!reference || reference.contextId !== contextId) { throw new Error('Unknown or stale MCP variable reference.'); }
+		const variables: (DebugProtocol.Variable & {
+			unavailable?: string; unavailableCode?: string; unavailableDetails?: LocalInspectionError['details'];
+			pointerDereferenceAllowed?: false;
+		})[] = [];
+		const convert = async (variable: InspectedVariable): Promise<void> => {
+			check();
+			const value = await variable.displayValue();
+			check();
+			const variablesReference = variable.expandable ? this.storeInspectionVariable({ ...reference, variable }) : 0;
+			variables.push({ name: variable.name() ?? '<unnamed>', value, variablesReference,
+				type: variable.type.Name ?? undefined, pointerDereferenceAllowed: false });
+		};
+		let total: number;
+		if (reference.variable) {
+			const page = await reference.variable.page(args.start, args.count, check);
+			total = page.total;
+			for (const variable of page.variables) { await convert(variable); }
+		} else {
+			if (!reference.stack) { throw new Error('MCP variable reference has no stack or captured value.'); }
+			const ids = await this.tcfClient.sendCommand(new GetChildrenExpressionCommand(reference.stack));
+			check();
+			if (ids.length > 4096) { throw new Error('Local-variable metadata exceeds 4096 entries.'); }
+			total = ids.length;
+			for (const id of ids.slice(args.start, args.start + args.count)) {
+				check();
+				try {
+					const variable = await this.tcfClient.getExpressionIDVariable(contextId, reference.stack, id, undefined, check);
+					check();
+					if (!(variable instanceof InspectedVariable)) { throw new Error('Unsupported or unavailable local variable type.'); }
+					await convert(variable);
+				} catch (error) {
+					check();
+					const message = String(error);
+					const diagnostic = error instanceof LocalInspectionError
+						? { unavailableCode: error.code, unavailableDetails: error.details } : {};
+					this.tcfLogger.error(`MCP local ${id}: ${message}${error instanceof LocalInspectionError ? ` ${JSON.stringify(diagnostic)}` : ''}`);
+					variables.push({ name: id, value: '<unavailable>', variablesReference: 0, unavailable: message, ...diagnostic });
+				}
+			}
+		}
+		check();
+		response.body = Object.assign({ variables }, { totalVariables: total, start: args.start });
+		this.sendResponse(response);
+	}
 	private enabledPathMapper: boolean;
 	private stackTraceDepth: number = -1;
 	private instructionSteppingEnabled = false;
@@ -643,11 +829,13 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 	}
 
 	protected override onThreadSuspended(thread: number) {
+		this.invalidateInspection(`thread ${thread} stopped`);
 		this.clearFrameMetaForThread(thread);
 		super.onThreadSuspended(thread);
 	}
 
 	protected override onThreadResumed(thread: number) {
+		this.invalidateInspection(`thread ${thread} resumed`);
 		this.clearFrameMetaForThread(thread);
 		super.onThreadResumed(thread);
 	}
@@ -1079,7 +1267,7 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 			}
 			const suspended = infos.filter(t => Boolean(t.state?.suspended)).map(t => t.info.ID);
 			this.startupLog(`emitStoppedForAllSuspendedAtStartup: suspended=${suspended.length ? suspended.join(', ') : '(none)'}`);
-			const targetReason = opts?.targetReason ?? StoppedEventReason.entry;
+			const targetReason = opts?.targetReason ?? StoppedEventReason.pause;
 
 			// Mark all suspended cores in our internal state and invalidate per-thread cached references.
 			for (const ctx of suspended) {
@@ -1329,9 +1517,11 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 		let unreadableBytes = 0;
 
 		for (let offset = 0; offset < count; offset += MEMORY_READ_FALLBACK_CHUNK_BYTES) {
+			this.checkNotDisconnecting();
 			const chunkSize = Math.min(MEMORY_READ_FALLBACK_CHUNK_BYTES, count - offset);
 			try {
 				const result = await this.tcfClient.sendCommand(new GetMemoryCommand(ctx, address + offset, 1, chunkSize, 0));
+				this.checkNotDisconnecting();
 				const data = result?.base64 ? Buffer.from(result.base64, 'base64') : Buffer.alloc(0);
 				if (data.length > 0) {
 					data.copy(buffer, offset, 0, Math.min(data.length, chunkSize));
@@ -1341,6 +1531,7 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 				const chunkUnreadable = Math.min(chunkSize, Math.max(missing, errorBytes));
 				unreadableBytes += chunkUnreadable;
 			} catch {
+				this.checkNotDisconnecting();
 				unreadableBytes += chunkSize;
 			}
 		}
@@ -1358,7 +1549,9 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 		// 4) Format and return the read bytes.
 		// For example, memoryReference="0x20000000", offset=16, count=32
 		// -> read 32 bytes starting at address 0x20000010
+		let peripheralRange: string | undefined;
 		try {
+			this.checkNotDisconnecting();
 			const memoryReference = typeof args?.memoryReference === 'string' ? args.memoryReference : '';
 			const base = this.parseMemoryReference(memoryReference);
 			if (base === undefined) {
@@ -1375,28 +1568,46 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 			}
 
 			const address = base + offset;
-			let ctx = (await this.pickContextIdForCore(this.launchCore)) ?? (await this.pickAnySuspendedContextId());
+			if (!Number.isSafeInteger(address) || address < 0 || !Number.isInteger(count) ||
+				address + count > 0x100000000) {
+				throw new Error('Invalid or overflowing memory read range.');
+			}
+			if (address + count > 0xf0000000 || this.nativePeripherals?.hasAddress(address)) {
+				peripheralRange = `0x${address.toString(16)} (${count} bytes)`;
+			}
+			let ctx = await this.pickContextIdForCore(this.launchCore);
+			this.checkNotDisconnecting();
 			if (!ctx) {
-				this.sendErrorResponse(response, 0, 'No suspended context for memory read');
+				ctx = await this.pickAnySuspendedContextId();
+				this.checkNotDisconnecting();
+			}
+			if (!ctx) {
+				throw new Error('No suspended context for memory read');
+			}
+			// Peripheral Viewer speaks DAP readMemory, but SFRs must never reach TCF Memory.get.
+			if (peripheralRange && this.nativePeripherals) {
+				const { check, verify } = await this.viewerContext(ctx);
+				const bytes = await this.nativePeripherals.readRange(ctx, address, count, check);
+				await verify();
+				check();
+				response.body = { address: `0x${address.toString(16)}`, data: bytes.toString('base64') };
+				this.sendResponse(response);
 				return;
 			}
-			// AURIX DAS agents crash (ECONNRESET) when peripheral/SFR space (0xF000_0000+) is
-			// accessed via Memory.get — regardless of whether the core is suspended or running.
-			// ACS (AURIX Configuration Studio) never issues Memory.get on these addresses; it reads
-			// peripherals exclusively through the TCF Registers service.
-			// Block all peripheral Memory.get to prevent the crash. The peripheral-viewer will show
-			// "unreadable" until a Registers-service-based path is implemented.
-			if (this.isPeripheralAddress(address)) {
-				response.body = {
-					address: `0x${address.toString(16)}`,
-					data: Buffer.alloc(count).toString('base64'),
-					unreadableBytes: count,
-				};
+			if (peripheralRange) {
+				const reader = await this.peripheralReader();
+				const options = { threadId: this.getOrAssignThreadId(ctx), epoch: this.inspectionEpoch, expiresAt: Date.now() + 9500 };
+				const { contextId, check } = await this.inspectionContext(options);
+				const bytes = await reader.readViewerRange(contextId, address, count, check);
+				await this.inspectionContext(options);
+				check();
+				response.body = { address: `0x${address.toString(16)}`, data: bytes.toString('base64') };
 				this.sendResponse(response);
 				return;
 			}
 			try {
 				const result = await this.tcfClient.sendCommand(new GetMemoryCommand(ctx, address, 1, count, 0));
+				this.checkNotDisconnecting();
 				const unreadableBytes = this.sumErrorBytes(result?.errorAddresses);
 				response.body = {
 					address: `0x${address.toString(16)}`,
@@ -1405,7 +1616,9 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 				};
 				this.sendResponse(response);
 			} catch (e) {
+				this.checkNotDisconnecting();
 				const fallback = await this.readMemoryBestEffort(ctx, address, count);
+				this.checkNotDisconnecting();
 				if (fallback) {
 					response.body = {
 						address: `0x${address.toString(16)}`,
@@ -1418,6 +1631,36 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 				this.sendErrorResponse(response, 0, 'readMemory failed {message}', { message: String(e) });
 			}
 		} catch (e) {
+			if (this.disconnecting) {
+				if (!this.memoryDisconnectReported) {
+					this.memoryDisconnectReported = true;
+					this.sendEvent(new OutputEvent(
+						`[Memory] Refresh cancelled during debug disconnect: ${String(e)}. No bytes returned.\n`, 'console'));
+				}
+				// Viewer stops its remaining refresh ranges on this non-user-facing DAP error.
+				this.sendErrorResponse(response, { id: 0, format: 'busy', showUser: false });
+				return;
+			}
+			if (peripheralRange && e instanceof InspectionStateChangedError) {
+				if (e.currentEpoch > this.lastPeripheralCancellationEpoch) {
+					this.lastPeripheralCancellationEpoch = e.currentEpoch;
+					this.sendEvent(new OutputEvent(
+						`[Peripheral Viewer] Refresh cancelled at ${peripheralRange}: ${e.reason} ` +
+						`(inspection epoch ${e.previousEpoch} -> ${e.currentEpoch}).\n` +
+						'No bytes returned; displayed values may be cached/default values. ' +
+						'Refresh after all cores are stopped and stable.\n', 'console'));
+				}
+				// Viewer recognizes this exact error and stops the remaining ranges in this refresh.
+				this.sendErrorResponse(response, { id: 0, format: 'busy', showUser: false });
+				return;
+			}
+			if (peripheralRange) {
+				this.sendEvent(new OutputEvent(
+					`[Peripheral Viewer] Read failed at ${peripheralRange}: ${String(e)}\n` +
+					'No peripheral bytes were returned. XPeripherals may still show cached/default values (including zero); ' +
+					'these are not measured values. After all cores are stopped and stable, refresh the peripheral. ' +
+					'See Peripheral Viewer output for details.\n', 'stderr'));
+			}
 			this.sendErrorResponse(response, 0, 'readMemory failed {message}', { message: String(e) });
 		}
 	}
@@ -1440,6 +1683,29 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 			const bytes = Buffer.from(dataBase64, 'base64');
 			const requestedLength = bytes.length;
 			const address = base + offset;
+			if (!Number.isSafeInteger(address) || address < 0 || address + requestedLength > 0x100000000) {
+				throw new Error('Invalid peripheral write address.');
+			}
+			if (address + requestedLength > 0xf0000000 || this.nativePeripherals?.hasAddress(address)) {
+				if (!this.nativePeripherals) { throw new Error('Native peripheral writes are unavailable; no memory fallback is allowed.'); }
+				if (!requestedLength || bytes.toString('base64') !== dataBase64) { throw new Error('Invalid peripheral write payload.'); }
+				const contextId = await this.pickContextIdForCore(this.launchCore);
+				if (!contextId) { throw new Error('No context for peripheral write.'); }
+				if (this.peripheralWritesInFlight) { throw new Error('Another peripheral write is in progress.'); }
+				this.peripheralWritesInFlight++;
+				try {
+					const { check } = await this.viewerContext(contextId);
+					await this.nativePeripherals.writeRegister(contextId, address, bytes, check);
+				} catch (error) {
+					throw new Error(`Peripheral write failed: ${String(error)} If dispatch occurred, the write may already have taken effect; it was not retried.`);
+				} finally {
+					this.peripheralWritesInFlight--;
+					this.invalidateInspection('manual peripheral write');
+				}
+				response.body = { offset: 0, bytesWritten: bytes.length };
+				this.sendResponse(response);
+				return;
+			}
 			let targetAddress = address;
 			let writeBytes = bytes;
 			let wordSize = this.computeWriteWordSize(address, bytes.length);
@@ -1609,6 +1875,16 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 	protected override async launchRequestAsync(response: DebugProtocol.LaunchResponse, rawArgs: DebugProtocol.LaunchRequestArguments): Promise<void> {
 		const args = rawArgs as AurixTCFLaunchRequestArguments;
 		this.launchCore = args.core;
+		this.inspectionMemoryRanges = undefined;
+		this.inspectionPeripheralProfile = args.peripheralReadProfile === 'disabled' ? undefined : preparedPeripheralProfile(args.svdFile);
+		this.mcpPeripheralMode = args.peripheralReadProfile === 'disabled' ? 'disabled' :
+			args.peripheralReadProfile === peripheralProfileName ? 'legacy' : 'full';
+		const peripheralCatalog = preparedPeripheralCatalog(args.svdFile);
+		this.nativePeripherals = peripheralCatalog ? new NativePeripheralAccess(command => this.tcfClient.sendCommand(command), peripheralCatalog) : undefined;
+		this.peripheralNotice = args.__aurixPeripheralNotice ?? (this.inspectionPeripheralProfile
+			? `Read-only peripheral profile: ${this.inspectionPeripheralProfile.registers.length} approved registers.`
+			: 'Peripheral reads are disabled or unavailable for this session; select a matching SVD and relaunch.');
+		this.sendEvent(new OutputEvent(`${this.peripheralNotice}\n`, 'console'));
 		this.instructionSteppingEnabled = args.instructionStepping === true;
 		this.liveWatchEnabled = args.liveWatchEnabled === true;
 		this.liveWatchIntervalMs = this.normalizeLiveWatchIntervalMs(args.liveWatchIntervalMs);
@@ -1767,7 +2043,7 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 					if (args.resumeOtherCoresOnEntry === true) {
 						// Only one core is expected to be stopped.
 						if (targetContext) {
-							await this.emitStoppedIfSuspended(targetContext, StoppedEventReason.entry);
+							await this.emitStoppedIfSuspended(targetContext, StoppedEventReason.pause);
 							await this.resumeOtherCoresIfNeeded(targetContext, args);
 						}
 					} else {
@@ -1785,6 +2061,7 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 	}
 
 	protected override async disconnectRequestAsync(response: DebugProtocol.DisconnectResponse): Promise<void> {
+		this.disconnecting = true;
 		this.cancelBreakpointStops('disconnect');
 		this.cancelPendingPauseStoppedTimers('disconnect');
 		this.pendingStepThreads.clear();
@@ -1875,6 +2152,7 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 	}
 
 	protected override async scopesRequestAsync(response: DebugProtocol.ScopesResponse, args: DebugProtocol.ScopesArguments): Promise<void> {
+		if ('aurixMcp' in args) { await this.inspectionScopes(response, args); return; }
 		if (this.startupDiagnosticsEnabled) {
 			const resolved = this.tryResolveFrame(args.frameId);
 			this.tcfLogger.log(
@@ -1907,6 +2185,7 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 	}
 
 	protected override async variablesRequestAsync(response: DebugProtocol.VariablesResponse, args: DebugProtocol.VariablesArguments): Promise<void> {
+		if ('aurixMcp' in args) { await this.inspectionVariablePage(response, args); return; }
 		if (this.startupDiagnosticsEnabled) {
 			let ctx = '';
 			try {
@@ -2080,7 +2359,13 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 			const v = await this.tcfClient.getExpressionIDVariable(ctx, stack ?? createParentContext, exprId, expressionText);
 
 			if (!v) {
-				throw new Error(`Cannot display expression '${expressionText}': unsupported value type`);
+				// Non-displayable symbols are an inline evaluation failure, not a session fault.
+				this.sendErrorResponse(response, {
+					id: 0, format: 'Evaluate error {message}',
+					variables: { message: `Cannot display expression '${expressionText}': unsupported value type` },
+					showUser: false,
+				});
+				return;
 			}
 
 			let variablesReference = 0;
@@ -2264,90 +2549,7 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 	}
 
 	private loadExecutableRangesFromElf(elfPath: string): Array<{ start: number; end: number }> {
-		const buf = fs.readFileSync(elfPath);
-		if (buf.length < 0x40) {
-			throw new Error('ELF file too small');
-		}
-		if (!(buf[0] === 0x7f && buf[1] === 0x45 && buf[2] === 0x4c && buf[3] === 0x46)) {
-			throw new Error('Not an ELF file');
-		}
-		const eiClass = buf[4]; // 1=32-bit, 2=64-bit
-		const eiData = buf[5]; // 1=little, 2=big
-		const little = eiData === 1;
-		const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-
-		const readU16 = (off: number) => view.getUint16(off, little);
-		const readU32 = (off: number) => view.getUint32(off, little);
-		const readU64 = (off: number) => Number(view.getBigUint64(off, little));
-
-		let phoff = 0;
-		let phentsize = 0;
-		let phnum = 0;
-		if (eiClass === 1) {
-			// ELF32
-			phoff = readU32(28);
-			phentsize = readU16(42);
-			phnum = readU16(44);
-		} else if (eiClass === 2) {
-			// ELF64
-			phoff = readU64(32);
-			phentsize = readU16(54);
-			phnum = readU16(56);
-		} else {
-			throw new Error(`Unknown ELF class: ${eiClass}`);
-		}
-
-		if (phoff <= 0 || phentsize <= 0 || phnum <= 0) {
-			return [];
-		}
-
-		const ranges: Array<{ start: number; end: number }> = [];
-		for (let i = 0; i < phnum; i++) {
-			const off = phoff + i * phentsize;
-			if (off + phentsize > buf.length) {
-				break;
-			}
-			let pType = 0;
-			let pFlags = 0;
-			let pVaddr = 0;
-			let pMemsz = 0;
-			if (eiClass === 1) {
-				pType = readU32(off + 0);
-				pFlags = readU32(off + 24);
-				pVaddr = readU32(off + 8);
-				pMemsz = readU32(off + 20);
-			} else {
-				pType = readU32(off + 0);
-				pFlags = readU32(off + 4);
-				pVaddr = readU64(off + 16);
-				pMemsz = readU64(off + 40);
-			}
-			// PT_LOAD = 1, PF_X = 0x1
-			if (pType === 1 && (pFlags & 0x1) !== 0 && pMemsz > 0) {
-				const start = pVaddr;
-				const end = pVaddr + pMemsz;
-				if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
-					ranges.push({ start, end });
-				}
-			}
-		}
-
-		// Merge overlapping/adjacent ranges.
-		ranges.sort((a, b) => a.start - b.start);
-		const merged: Array<{ start: number; end: number }> = [];
-		for (const r of ranges) {
-			const last = merged[merged.length - 1];
-			if (!last) {
-				merged.push({ ...r });
-				continue;
-			}
-			if (r.start <= last.end) {
-				last.end = Math.max(last.end, r.end);
-			} else {
-				merged.push({ ...r });
-			}
-		}
-		return merged;
+		return elfLoadRanges(fs.readFileSync(elfPath), 1);
 	}
 
 	protected override async stepInRequestAsync(response: DebugProtocol.StepInResponse, args: DebugProtocol.StepInArguments): Promise<void> {
@@ -2772,6 +2974,184 @@ export class AurixTCFDebugSession extends LifetimeDebugSession {
 	}
 
 	protected override async customRequestAsync(command: string, response: DebugProtocol.Response, args: any, request?: DebugProtocol.Request): Promise<void> {
+		if (command === 'aurix-tcf/mcpGlobals') {
+			const input = globalLookupSchema.extend({ aurixMcp: inspectionOptionsSchema }).strict().parse(args);
+			const { contextId, check } = await this.inspectionContext(input.aurixMcp);
+			if (!this.programPath) { throw new Error('Global inspection requires a selected ELF with debug symbols.'); }
+			const inspector = new GlobalVariableInspector(command => this.tcfClient.sendCommand(command), this.programPath);
+			const selections = await inspector.lookup(contextId, { name: input.name, source: input.source }, check);
+			await this.inspectionContext(input.aurixMcp);
+			check();
+			if (this.inspectionGlobals.size + selections.filter(selection => selection.metadata.readable).length > 4096) {
+				throw new Error('MCP global symbol reference limit reached; execution invalidates old references.');
+			}
+			response.body = { name: input.name, source: input.source, elfSha256: inspector.elfSha256,
+				symbols: selections.map(selection => {
+					const reference = selection.metadata.readable ? ++this.inspectionReference : 0;
+					if (reference) { this.inspectionGlobals.set(reference, selection); }
+					return { ...selection.metadata, reference };
+				}) };
+			this.sendResponse(response);
+			return;
+		}
+		if (command === 'aurix-tcf/mcpReadGlobal') {
+			const input = z.object({ reference: z.number().int().positive(), aurixMcp: inspectionOptionsSchema }).strict().parse(args);
+			const { contextId, check } = await this.inspectionContext(input.aurixMcp);
+			const selection = this.inspectionGlobals.get(input.reference);
+			if (!selection || selection.contextId !== contextId) { throw new Error('Unknown, cross-core or stale MCP global symbol reference.'); }
+			if (!this.programPath) { throw new Error('Global inspection requires a selected ELF.'); }
+			const inspector = new GlobalVariableInspector(command => this.tcfClient.sendCommand(command), this.programPath);
+			const result = await inspector.read(selection, check);
+			await this.inspectionContext(input.aurixMcp);
+			check();
+			const variablesReference = result.variable.expandable ? this.storeInspectionVariable({ contextId, variable: result.variable }) : 0;
+			response.body = { elfSha256: inspector.elfSha256, variable: { ...result.value, variablesReference } };
+			this.sendResponse(response);
+			return;
+		}
+		if (command === 'aurix-tcf/mcpRevokePeripheralWrite') {
+			const { token } = z.object({ token: z.string().uuid() }).strict().parse(args);
+			const ticket = this.peripheralWriteTickets.get(token);
+			if (ticket) { ticket.cancelled = true; this.peripheralWriteTickets.delete(token); }
+			response.body = { revoked: ticket !== undefined };
+			this.sendResponse(response);
+			return;
+		}
+		if (command === 'aurix-tcf/mcpPreparePeripheralWrite') {
+			const input = z.object({ registerId: z.string(), value: z.string().max(128), aurixMcp: inspectionOptionsSchema }).strict().parse(args);
+			if (this.mcpPeripheralMode !== 'full' || !this.nativePeripherals) { throw new Error('Full-SVD MCP peripheral writes are unavailable for this session.'); }
+			const { contextId, check } = await this.inspectionContext(input.aurixMcp);
+			const plan = await this.nativePeripherals.prepareWrite(contextId, input.registerId, input.value, check);
+			await this.inspectionContext(input.aurixMcp);
+			for (const [key, ticket] of this.peripheralWriteTickets) {
+				if (ticket.expiresAt <= Date.now()) { ticket.cancelled = true; this.peripheralWriteTickets.delete(key); }
+			}
+			if (this.peripheralWriteTickets.size >= 16) { throw new Error('Too many pending peripheral write confirmations.'); }
+			const token = randomUUID(), expiresAt = Date.now() + 120000;
+			this.peripheralWriteTickets.set(token, { plan, access: this.nativePeripherals, threadId: input.aurixMcp.threadId,
+				epoch: input.aurixMcp.epoch, expiresAt, consumed: false, cancelled: false });
+			response.body = { token, id: plan.id, name: plan.name, address: plan.address, size: plan.size, valueHex: plan.valueHex,
+				threadId: input.aurixMcp.threadId, contextId, epoch: input.aurixMcp.epoch, expiresAt };
+			this.sendResponse(response);
+			return;
+		}
+		if (command === 'aurix-tcf/mcpCommitPeripheralWrite') {
+			const input = z.object({ token: z.string().uuid(), aurixMcp: inspectionOptionsSchema }).strict().parse(args);
+			const ticket = this.peripheralWriteTickets.get(input.token);
+			if (!ticket || ticket.consumed) { throw new Error('Peripheral write confirmation is unknown, expired or already consumed.'); }
+			ticket.consumed = true;
+			let reserved = false;
+			try {
+				if (this.mcpPeripheralMode !== 'full' || this.nativePeripherals !== ticket.access || ticket.cancelled ||
+					ticket.epoch !== input.aurixMcp.epoch || ticket.threadId !== input.aurixMcp.threadId || Date.now() >= ticket.expiresAt) {
+					throw new Error('Peripheral write confirmation no longer matches this session/state.');
+				}
+				if (this.peripheralWritesInFlight) { throw new Error('Another peripheral write is in progress.'); }
+				this.peripheralWritesInFlight++;
+				reserved = true;
+				const { contextId, check } = await this.inspectionContext(input.aurixMcp, true);
+				if (contextId !== ticket.plan.contextId) { throw new Error('Peripheral write core changed after confirmation.'); }
+				const guard = () => {
+					check();
+					if (ticket.cancelled || Date.now() >= ticket.expiresAt) { throw new Error('Peripheral write confirmation was cancelled or expired.'); }
+				};
+				await ticket.access.commitWrite(ticket.plan, guard);
+			} finally {
+				this.peripheralWriteTickets.delete(input.token);
+				if (reserved) { this.peripheralWritesInFlight--; this.invalidateInspection('MCP peripheral write'); }
+			}
+			response.body = { id: ticket.plan.id, name: ticket.plan.name, address: ticket.plan.address, size: ticket.plan.size,
+				valueHex: ticket.plan.valueHex, evidence: 'Registers.set', writes: 1, readBackPerformed: false, inspectionEpoch: this.inspectionEpoch };
+			this.sendResponse(response);
+			return;
+		}
+		if (command === 'aurix-tcf/mcpReadMemory') {
+			const input = memoryReadSchema.extend({ aurixMcp: inspectionOptionsSchema }).parse(args);
+			const { contextId, check } = await this.inspectionContext(input.aurixMcp);
+			if (!this.programPath) { throw new Error('No ELF was selected for bounded memory inspection.'); }
+			this.inspectionMemoryRanges ??= readableElfRanges(this.programPath);
+			response.body = await readInspectedMemory(command => this.tcfClient.sendCommand(command), contextId,
+				this.inspectionMemoryRanges, { address: input.address, count: input.count }, check);
+			await this.inspectionContext(input.aurixMcp);
+			check();
+			this.sendResponse(response);
+			return;
+		}
+		if (command === 'aurix-tcf/mcpPeripherals') {
+			const input = peripheralPageSchema.extend({
+				aurixMcp: inspectionOptionsSchema,
+				registerIds: z.array(z.string().min(1).max(4096)).min(1).max(32).optional(),
+			}).strict().parse(args);
+			const { contextId, check } = await this.inspectionContext(input.aurixMcp);
+			const reader = await this.peripheralReader();
+			response.body = input.registerIds ? { registers: await reader.read(contextId, input.registerIds, check) }
+				: reader.catalog({ start: input.start, count: input.count, filter: input.filter, exactNames: input.exactNames }, check);
+			await this.inspectionContext(input.aurixMcp);
+			check();
+			this.sendResponse(response);
+			return;
+		}
+		if (command === 'aurix-tcf/mcpState') {
+			const threads = await this.tcfClient.getThreads(true);
+			response.body = {
+				instructionStepping: this.instructionSteppingEnabled,
+				inspectionEpoch: this.inspectionEpoch,
+				threads: threads.map(thread => {
+					const pc = thread.state.data?.PCError ? undefined : targetAddress(thread.state.pc);
+					return {
+						id: this.getOrAssignThreadId(thread.info.ID),
+						name: thread.info.Name || thread.info.ID,
+						contextId: thread.info.ID,
+						suspended: thread.state.suspended,
+						...(thread.state.suspended ? { stop: {
+							evidence: 'RunControl.getState', reason: thread.state.lastStateReason ?? null,
+							instructionPointerReference: pc === undefined ? null : `0x${pc.toString(16)}`,
+							...(pc === undefined ? { pcUnavailable: 'Agent PC is missing, invalid, or reported with PCError.' } : {}),
+							breakpointIds: thread.state.data?.BPs,
+						} } : {}),
+					};
+				}),
+			};
+			this.sendResponse(response);
+			return;
+		}
+		if (command === 'aurix-tcf/mcpBreakpointStatus') {
+			const request = z.object({
+				source: z.string().min(1).max(4096), line: z.number().int().positive(),
+				expiresAt: z.number().int().positive(),
+			}).strict().parse(args);
+			const key = (source: string) => process.platform === 'win32' ? path.normalize(source).toLowerCase() : path.normalize(source);
+			const matches = this.breakpointsManager.getAll().filter(bp => key(bp.file) === key(request.source) && bp.line === request.line);
+			if (matches.length !== 1) { throw new Error('Source breakpoint is absent or ambiguous in this adapter; no native ID was guessed.'); }
+			const revision = this.breakpointRevision;
+			const epoch = this.inspectionEpoch;
+			const check = () => {
+				if (revision !== this.breakpointRevision || epoch !== this.inspectionEpoch) {
+					throw new Error('Breakpoint or execution state changed during evidence lookup; discard this result.');
+				}
+				if (Date.now() >= request.expiresAt || request.expiresAt > Date.now() + 15000) {
+					throw new Error('Breakpoint evidence deadline expired or invalid.');
+				}
+			};
+			const reader = new BreakpointInspector(c => this.tcfClient.sendCommand(c), area => this.resolveMappedSourcePath(area));
+			response.body = await reader.read(this.breakpointIdToTcfId(matches[0].id), check);
+			check();
+			this.sendResponse(response);
+			return;
+		}
+		if (command === 'aurix-tcf/mcpRegisters') {
+			const request = z.object({
+				aurixMcp: inspectionOptionsSchema,
+				registerIds: z.array(z.string().min(1).max(4096)).min(1).max(32).optional(),
+			}).strict().parse(args);
+			const { contextId, check } = await this.inspectionContext(request.aurixMcp);
+			const reader = new CoreRegisterReader(c => this.tcfClient.sendCommand(c));
+			response.body = { registers: request.registerIds
+				? await reader.read(contextId, request.registerIds, check) : await reader.list(contextId, check) };
+			check();
+			this.sendResponse(response);
+			return;
+		}
 		if (command === 'aurix-tcf/frameSource') {
 			if (!Number.isInteger(args?.frameId) || !Number.isInteger(args?.threadId)) {
 				throw new Error('frameSource requires integer frameId and threadId');

@@ -250,7 +250,7 @@ function asExpressionId(json: any): string {
 // see https://download.eclipse.org/tools/tcf/tcf-docs/TCF%20Service%20-%20Expressions.html#CmdGetContext
 // TODO: Should be cached by clients
 /* eslint-disable @typescript-eslint/naming-convention */
-interface ExpressionsContextData {
+export interface ExpressionsContextData {
     ID: string,
     ParentID?: string,
     SymbolID?: string,

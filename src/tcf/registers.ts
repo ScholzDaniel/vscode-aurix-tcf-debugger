@@ -2,7 +2,8 @@
 Copyright (C) 2023 Intel Corporation
 SPDX-License-Identifier: MIT
 */
-import { ValidatingCommand, asNullable, asString, asStringNullableArray, validateJSON } from "./tcfutils";
+import { ValidatingCommand, SimpleCommand, PromiseSuccess, PromiseError, parseEmptyResponse, toBuffer,
+    asNullable, asString, asStringNullableArray, validateJSON } from "./tcfutils";
 import * as validateRegistersContextData from './validators/validate-RegistersContextData';
 
 abstract class RegistersValidatingCommand<T> extends ValidatingCommand<T> {
@@ -116,5 +117,19 @@ export class GetRegistersCommand extends RegistersValidatingCommand<Buffer> {
     override cast(json: any): Buffer {
         const s = asString(json); //validates
         return Buffer.from(s, "base64");
+    }
+}
+
+export class SetRegistersCommand extends SimpleCommand<undefined> {
+    constructor(readonly contextID: string, readonly bytes: Buffer) { super(); }
+    service(): string { return "Registers"; }
+    command(): string { return "set"; }
+    arguments(): undefined { return undefined; }
+    debugDescription(tokenID: number): string { return `Registers/${tokenID}/set/${this.contextID}`; }
+    override toBuffer(token: string): Buffer {
+        return toBuffer(["C", token, this.service(), this.command(), JSON.stringify(this.contextID), JSON.stringify(this.bytes.toString("base64"))]);
+    }
+    result(response: Buffer[], success: PromiseSuccess<undefined>, error: PromiseError<undefined>): void {
+        parseEmptyResponse(response, success, error);
     }
 }
