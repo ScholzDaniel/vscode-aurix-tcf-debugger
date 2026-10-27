@@ -1,5 +1,24 @@
 # Third-Party Notices
 
+## MCP runtime dependencies
+
+The extension uses the official MCP TypeScript SDK
+(`@modelcontextprotocol/server`, `@modelcontextprotocol/node` and their runtime
+dependencies) and Zod for tool schemas. The MCP SDK packages are Apache-2.0
+licensed; Zod is MIT licensed. Their original license files remain in the
+distributed npm packages. Dependency versions and transitive packages are
+recorded in `package-lock.json`. The MCP client SDK is a development/test
+dependency only.
+
+The SAX parser (`sax`, BlueOak-1.0.0 licensed) is used to extract a bounded, reviewed
+register profile from the bundled vendor SVD. Its original license remains in
+the distributed npm package. `@types/sax` is a development-only dependency.
+The MCP register policy is an inspection subset, not a replacement device
+specification. Manual Viewer/Agent launch snapshots retain the complete source
+SVD and its original notices and access metadata.
+
+## Project source and bundled backend tools
+
 The MIT license in [`LICENSE`](LICENSE) covers only the source code written for
 this project (everything under `src/`, `scripts/`, `media/`, and the project
 configuration files).

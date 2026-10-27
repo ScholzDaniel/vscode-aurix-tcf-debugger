@@ -21,7 +21,7 @@
     "TC39x_B_step.json",
     "TC39x_B_step_Extended_ADAS.json",
     "TC3Ex_A_step.json",
-	"TC44x_A_step.json",
+      "TC44x_A_step.json",
     "TC45x_A_step.json",
     "TC46x_A_step.json",
     "TC48x_A_step.json",
@@ -29,6 +29,7 @@
     "TC49x_A_step.json",
     "TC4Dx_A_step.json",
     "TC4Zx_A_step.json",
-	"TC4Ex_A_step.json"
+      "TC4Ex_A_step.json",
+      "TC4Px_A_step.json"
   ]
 }

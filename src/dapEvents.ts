@@ -50,9 +50,14 @@ export class DapEvents {
 		name: string,
 		after: number,
 		timeoutMs: number,
-		predicate: EventPredicate = () => true
+		predicate: EventPredicate = () => true,
+		signal?: AbortSignal
 	): Promise<DebugProtocol.Event> {
 		return new Promise((resolve, reject) => {
+			if (signal?.aborted) {
+				reject(signal.reason);
+				return;
+			}
 			if (this.closed) {
 				reject(this.closed);
 				return;
@@ -67,12 +72,14 @@ export class DapEvents {
 			const finish = (error?: Error, event?: DebugProtocol.Event) => {
 				clearTimeout(timer);
 				this.waiters.delete(waiter);
+				signal?.removeEventListener('abort', abort);
 				if (error) {
 					reject(error);
 				} else {
 					resolve(event!);
 				}
 			};
+			const abort = () => finish(signal?.reason instanceof Error ? signal.reason : new Error('Event wait cancelled'));
 			const waiter: EventWaiter = {
 				accept: (event) => {
 					try {
@@ -87,6 +94,7 @@ export class DapEvents {
 			};
 			const timer = setTimeout(() => finish(new Error(`Timed out waiting for DAP '${name}' after ${timeoutMs}ms`)), timeoutMs);
 			this.waiters.add(waiter);
+			signal?.addEventListener('abort', abort, { once: true });
 		});
 	}
 

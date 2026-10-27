@@ -12,19 +12,30 @@ import * as fs from 'fs';
 import * as crypto from 'crypto';
 import { AurixTCFDebugSession } from './debugProvider';
 import { ChildProcess, execFile, spawn } from 'child_process';
+import { listDasDevices } from './deviceDiscovery';
 import { pipeline } from 'stream/promises';
 import { createGunzip } from 'zlib';
 import { showDebugConfigPanel } from './debugConfigPanel';
+import { installDebugSkill } from './debugSkill';
 import { LiveWatchProvider } from './liveWatchView';
 import { getSvdOptionsForDevice } from './svdCatalog';
-import { buildFlasherArgs, createFlashingPlan, selectFlasherDeviceId } from './flashing';
+import { buildFlasherArgs, createFlashingPlan, selectFlasherDevice } from './flashing';
 import { resolveConfigPath } from './configPaths';
+import { DebugMcpRegistration } from './mcp/extension';
+import { preparePeripheralLaunch, preparedPeripheralAgentSvd } from './peripheralProfile';
+import { AgentRelease, DebugMcpError } from './mcp/debugController';
+import { DebugLifecycleGate } from './mcp/launch';
+import { waitForProcessExit, waitForTcpPortClosed } from './agentLifecycle';
 
 let tcfAgentProcess: ChildProcess | undefined;
+let agentAwaitingCleanup: ChildProcess | undefined;
+const debugLifecycle = new DebugLifecycleGate();
+const sessionAgents = new Map<string, { process: ChildProcess; host: string; port: number }>();
 let agentStopPromise: Promise<void> = Promise.resolve();
 let extensionContext: vscode.ExtensionContext;
 let agentOutput: vscode.OutputChannel | undefined;
 let flasherOutput: vscode.OutputChannel | undefined;
+let debugMcp: DebugMcpRegistration | undefined;
 let activeAurixSessions = 0;
 let startingAurixSessions = 0;
 let pendingStopTimer: NodeJS.Timeout | undefined;
@@ -54,6 +65,8 @@ export function activate(context: vscode.ExtensionContext) {
 	agentOutput = vscode.window.createOutputChannel('AURIX TCF Agent');
 	flasherOutput = vscode.window.createOutputChannel('AURIX Flasher');
 	context.subscriptions.push(flasherOutput);
+	debugMcp = new DebugMcpRegistration(context, debugLifecycle, releaseMcpAgent);
+	context.subscriptions.push(debugMcp);
 	liveWatchProvider = new LiveWatchProvider(context);
 	context.subscriptions.push(liveWatchProvider);
 
@@ -79,6 +92,10 @@ export function activate(context: vscode.ExtensionContext) {
 		vscode.commands.registerCommand('aurix-tcf.openDebugConfig', () => {
 			void showDebugConfigPanel(context);
 		})
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('aurix-tcf.installDebugSkill', () => installDebugSkill(context))
 	);
 
 	context.subscriptions.push(
@@ -304,6 +321,7 @@ export function activate(context: vscode.ExtensionContext) {
 				return;
 			}
 			sourceRevealGeneration++;
+			debugLifecycle.endSession(session.id);
 			activeAurixSessions = Math.max(0, activeAurixSessions - 1);
 			if (activeAurixSessions === 0) {
 				updateInstructionSteppingStatus(lastInstructionSteppingEnabled, false);
@@ -322,7 +340,8 @@ export function activate(context: vscode.ExtensionContext) {
 					if (
 						stopToken === pendingStopToken &&
 						activeAurixSessions === 0 &&
-						startingAurixSessions === 0
+						startingAurixSessions === 0 &&
+						!debugLifecycle.busy
 					) {
 						void stopTCFAgent('debug session terminated').catch(reportAgentStopError);
 					}
@@ -344,6 +363,7 @@ export function activate(context: vscode.ExtensionContext) {
 export class AurixTCFDebugAdapterFactory implements vscode.DebugAdapterDescriptorFactory {
     // Create the debug adapter descriptor for a debug session
 	async createDebugAdapterDescriptor(session: vscode.DebugSession): Promise<vscode.ProviderResult<vscode.DebugAdapterDescriptor>> {
+		debugLifecycle.beginSession(session.id, session.configuration);
 		startingAurixSessions++;
 		// VS Code Restart can create a new session/adapter before firing onDidStartDebugSession.
 		// Cancel any pending shutdown early so we don't kill the agent mid-start.
@@ -375,7 +395,7 @@ export class AurixTCFDebugAdapterFactory implements vscode.DebugAdapterDescripto
 			// Preflight: validate targetDevice early so typos fail fast.
 			if (typeof config.targetDevice === 'string' && config.targetDevice.trim() !== '') {
 				try {
-					await validateAgentTargetDevice(config.targetDevice);
+					await validateAgentTargetDevice(config.targetDevice, typeof config.__aurixMcpLaunchId === 'string');
 				} catch (e) {
 					const msg = e instanceof Error ? e.message : String(e);
 					void vscode.window.showErrorMessage(`Invalid targetDevice for agent: ${msg}`);
@@ -412,7 +432,7 @@ export class AurixTCFDebugAdapterFactory implements vscode.DebugAdapterDescripto
 			
 			// -r svd_file_path
 			if (config.svdFile) {
-				agentArgs.push('-r', config.svdFile);
+				agentArgs.push('-r', preparedPeripheralAgentSvd(config.svdFile) ?? config.svdFile);
 			}
 			
 			// -K workspace_path
@@ -449,7 +469,16 @@ export class AurixTCFDebugAdapterFactory implements vscode.DebugAdapterDescripto
 			const host = config.host || '127.0.0.1';
 			const port = config.port || 1534;
 
+			debugLifecycle.checkConfiguration(config);
 			await startTCFAgent(agentPath, agentArgs, host, port);
+			if (tcfAgentProcess) {
+				sessionAgents.set(session.id, { process: tcfAgentProcess, host, port });
+				if (sessionAgents.size > 64) {
+					const oldest = sessionAgents.keys().next().value;
+					if (oldest !== undefined) { sessionAgents.delete(oldest); }
+				}
+			}
+			debugLifecycle.checkConfiguration(config);
 		}
 
 		// Enable path mapper based on workspace trust and configuration
@@ -459,82 +488,22 @@ export class AurixTCFDebugAdapterFactory implements vscode.DebugAdapterDescripto
 		const enablePathMapper = vscode.workspace.isTrusted && pathMapperConfig === true;
 		
 		return new vscode.DebugAdapterInlineImplementation(new AurixTCFDebugSession(enablePathMapper));
+		} catch (error) {
+			debugLifecycle.endSession(session.id);
+			if (typeof session.configuration.__aurixMcpLaunchId === 'string') {
+				try { await stopTCFAgent('MCP launch failed'); }
+				catch (cleanupError) { throw new Error(`${String(error)}; owned Agent cleanup also failed: ${String(cleanupError)}`); }
+			}
+			throw error;
 		} finally {
 			startingAurixSessions = Math.max(0, startingAurixSessions - 1);
 		}
 	}
 }
 
-function parseCsvLine(line: string): string[] {
-	// Minimal CSV parser supporting quoted fields.
-	const fields: string[] = [];
-	let current = '';
-	let inQuotes = false;
-	for (let i = 0; i < line.length; i++) {
-		const ch = line[i];
-		if (ch === '"') {
-			if (inQuotes && line[i + 1] === '"') {
-				current += '"';
-				i++;
-				continue;
-			}
-			inQuotes = !inQuotes;
-			continue;
-		}
-		if (ch === ',' && !inQuotes) {
-			fields.push(current.trim());
-			current = '';
-			continue;
-		}
-		current += ch;
-	}
-	fields.push(current.trim());
-	return fields;
-}
+async function listLsmcddDevices() { return listDasDevices(extensionContext.extensionPath); }
 
-type LsmcddDevice = {
-	id: string;
-	name: string;
-	family: string;
-};
-
-async function listLsmcddDevices(): Promise<LsmcddDevice[]> {
-	const exePath = path.join(extensionContext.extensionPath, 'bin', 'lsmcdd.exe');
-	if (!fs.existsSync(exePath)) {
-		throw new Error(`lsmcdd.exe not found: ${exePath}`);
-	}
-	const output = await new Promise<string>((resolve, reject) => {
-		execFile(
-			exePath,
-			{ cwd: path.dirname(exePath), windowsHide: true, maxBuffer: 5 * 1024 * 1024, timeout: 10_000 },
-			(err, stdout, stderr) => {
-			const combined = (stdout && stdout.trim().length > 0) ? stdout : (stderr ?? '');
-			if (err && (!combined || combined.trim().length === 0)) {
-				reject(new Error((stderr || err.message || 'Unknown error').trim()));
-				return;
-			}
-			resolve(combined ?? '');
-		}
-		);
-	});
-	const devices: LsmcddDevice[] = [];
-	for (const rawLine of output.split(/\r?\n/)) {
-		const line = rawLine.trim();
-		if (!line) {
-			continue;
-		}
-		const fields = parseCsvLine(line);
-		const id = (fields[0] ?? '').trim();
-		const name = (fields[1] ?? '').trim();
-		const family = (fields[3] ?? '').trim();
-		if (id !== '' && name !== '') {
-			devices.push({ id, name, family });
-		}
-	}
-	return devices;
-}
-
-async function validateAgentTargetDevice(targetDevice: string): Promise<void> {
+async function validateAgentTargetDevice(targetDevice: string, strict = false): Promise<void> {
 	const raw = targetDevice.trim();
 	if (raw === '') {
 		return;
@@ -559,7 +528,7 @@ async function validateAgentTargetDevice(targetDevice: string): Promise<void> {
 		const msg = e instanceof Error ? e.message : String(e);
 		agentOutput?.appendLine(`Warning: could not validate targetDevice via lsmcdd.exe: ${msg}`);
 		// Re-throw only for definite mismatch errors (which include 'Available:').
-		if (typeof msg === 'string' && msg.includes('Available:')) {
+		if (strict || (typeof msg === 'string' && msg.includes('Available:'))) {
 			throw e;
 		}
 	}
@@ -576,8 +545,8 @@ async function runAurixFlasher(elfPath: string, targetDevice: string | undefined
 		flasherOutput?.appendLine(`Flashing HEX: ${hex}`);
 	}
 	flasherOutput?.appendLine(`Resolving device id via lsmcdd.exe (targetDevice='${targetDevice ?? ''}')...`);
-	const deviceId = selectFlasherDeviceId(await listLsmcddDevices(), targetDevice);
-	const args = buildFlasherArgs(elfPath, hexFiles, deviceId);
+	const device = selectFlasherDevice(await listLsmcddDevices(), targetDevice);
+	const args = buildFlasherArgs(elfPath, hexFiles, device);
 
 	const run = (commandArgs: string[]): Promise<number> => {
 		flasherOutput?.appendLine(`Command: ${flasherExe} ${commandArgs.join(' ')}`);
@@ -784,6 +753,7 @@ export class AurixTCFConfigurationProvider implements vscode.DebugConfigurationP
 		config: vscode.DebugConfiguration, 
 		token?: vscode.CancellationToken
 	): Promise<vscode.DebugConfiguration | undefined> {
+		debugLifecycle.checkConfiguration(config);
 
 		// This extension does not support user-facing attach sessions.
 		if ((config as any).request === 'attach') {
@@ -859,8 +829,39 @@ export class AurixTCFConfigurationProvider implements vscode.DebugConfigurationP
 			(config as any).definitionPath = usableSvd;
 		}
 
+		if (!extensionContext) { throw new Error('Extension storage is unavailable for the peripheral inspection profile.'); }
+		await preparePeripheralLaunch(config, extensionContext.globalStorageUri.fsPath);
+
 		return config;
 	}
+
+	resolveDebugConfigurationWithSubstitutedVariables(
+		_folder: vscode.WorkspaceFolder | undefined, config: vscode.DebugConfiguration
+	): vscode.DebugConfiguration {
+		debugLifecycle.checkConfiguration(config);
+		return config;
+	}
+}
+
+async function releaseMcpAgent(session: vscode.DebugSession): Promise<AgentRelease> {
+	const owned = sessionAgents.get(session.id);
+	if (!owned) {
+		if (session.configuration.autoStartAgent) {
+			throw new DebugMcpError('RELEASE_UNCONFIRMED', 'No owned Agent was recorded for this session. Check the AURIX TCF Agent output; device release cannot be confirmed.');
+		}
+		return { ownership: 'external', agentReleased: false, deviceAccessVerified: false,
+			message: 'The external Agent was not stopped. Release it separately before flashing.' };
+	}
+	if ((tcfAgentProcess && tcfAgentProcess !== owned.process) ||
+		(agentAwaitingCleanup && agentAwaitingCleanup !== owned.process)) {
+		throw new DebugMcpError('BUSY', 'The owned Agent has been replaced. The other process will not be stopped.');
+	}
+	if (pendingStopTimer) { clearTimeout(pendingStopTimer); pendingStopTimer = undefined; }
+	pendingStopToken++;
+	await stopTCFAgent('MCP debug_stop');
+	await waitForProcessExit(owned.process, 10000);
+	await waitForTcpPortClosed(owned.host, owned.port, 10000);
+	return { ownership: 'extension', agentReleased: true, processExited: true, portClosed: true, deviceAccessVerified: false };
 }
 
 async function startTCFAgent(agentPath: string, args: string[], host: string, port: number): Promise<void> {
@@ -881,6 +882,7 @@ async function startTCFAgent(agentPath: string, args: string[], host: string, po
 		windowsHide: true,
 	});
 	tcfAgentProcess = proc;
+	agentAwaitingCleanup = proc;
 
 	proc.stdout?.on('data', (data) => {
 		agentOutput?.appendLine(String(data).trimEnd());
@@ -920,21 +922,22 @@ function reportAgentStopError(error: unknown): void {
 }
 
 function stopTCFAgent(reason: string): Promise<void> {
-	agentStopPromise = agentStopPromise.then(() => stopTCFAgentProcess(reason));
-	return agentStopPromise;
+	const stopping = agentStopPromise.then(() => stopTCFAgentProcess(reason));
+	agentStopPromise = stopping.catch(error => agentOutput?.appendLine(`Agent shutdown incomplete: ${String(error)}`));
+	return stopping;
 }
 
 async function stopTCFAgentProcess(reason: string): Promise<void> {
 	// Stop the TCF agent process if running
-	if (!tcfAgentProcess) {
+	if (!agentAwaitingCleanup) {
 		return;
 	}
 
-	const proc = tcfAgentProcess;
+	const proc = agentAwaitingCleanup;
 	const pid = proc.pid;
-	tcfAgentProcess = undefined;
 
 	if (!pid) {
+		if (agentAwaitingCleanup === proc) { agentAwaitingCleanup = undefined; }
 		return;
 	}
 
@@ -944,7 +947,7 @@ async function stopTCFAgentProcess(reason: string): Promise<void> {
 		if (process.platform === 'win32') {
 			// Kill the whole process tree; aurix-debugger.exe may spawn helper processes.
 			await new Promise<void>((resolve, reject) => {
-				execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, (err, stdout, stderr) => {
+				execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, timeout: 10000 }, (err, stdout, stderr) => {
 					if (stdout) {
 						agentOutput?.appendLine(String(stdout).trimEnd());
 					}
@@ -965,44 +968,12 @@ async function stopTCFAgentProcess(reason: string): Promise<void> {
 		}
 	}
 
+	await waitForProcessExit(proc, 10000);
 	if (lastAgentHost && typeof lastAgentPort === 'number') {
 		await waitForTcpPortClosed(lastAgentHost, lastAgentPort, 10_000);
 	}
-}
-
-function waitForTcpPortClosed(host: string, port: number, timeoutMs: number): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	return new Promise((resolve, reject) => {
-		const tryOnce = () => {
-			const socket = new net.Socket();
-			socket.setTimeout(500);
-			socket.once('connect', () => {
-				socket.destroy();
-				retryOrFail();
-			});
-			socket.once('timeout', () => {
-				socket.destroy();
-				// timeout means no clean refusal; keep trying until deadline
-				retryOrFail();
-			});
-			socket.once('error', () => {
-				socket.destroy();
-				// ECONNREFUSED/ENOTFOUND => port not listening
-				resolve();
-			});
-
-			const retryOrFail = () => {
-				if (Date.now() >= deadline) {
-					reject(new Error(`Timed out waiting for ${host}:${port} to close`));
-					return;
-				}
-				setTimeout(tryOnce, 150);
-			};
-
-			socket.connect(port, host);
-		};
-		tryOnce();
-	});
+	if (agentAwaitingCleanup === proc) { agentAwaitingCleanup = undefined; }
+	if (tcfAgentProcess === proc) { tcfAgentProcess = undefined; }
 }
 
 function waitForTcpPort(host: string, port: number, timeoutMs: number): Promise<void> {
@@ -1254,9 +1225,13 @@ async function revealSelectedFrameSource(item: vscode.DebugStackFrame, generatio
 	}
 }
 
-export function deactivate() {
+export async function deactivate() {
 	sourceRevealGeneration++;
-	void stopTCFAgent('extension deactivate').catch(reportAgentStopError);
-	agentOutput?.dispose();
-	agentOutput = undefined;
+	try {
+		await debugMcp?.close();
+	} finally {
+		await stopTCFAgent('extension deactivate').catch(reportAgentStopError);
+		agentOutput?.dispose();
+		agentOutput = undefined;
+	}
 }

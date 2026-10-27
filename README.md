@@ -2,94 +2,74 @@
 
 > **Disclaimer:** This is a personal project, built and maintained by one developer in my own time. It is not an official Infineon product and has nothing to do with Infineon Technologies AG. It comes with no warranty and no promise of support or future updates. Use it at your own risk.
 
-This extension brings the TCF Debugger from [AURIX&trade; Configuration Studio](https://www.infineon.com/design-resources/platforms/aurix-software-tools/aurix-tools/aurix-configuration-studio) to VS Code. It talks to the TCF agent; the VS Code frontend (the debug adapter, UI, and views) is implemented here. AURIX Flasher is bundled for optional pre-debug flashing and as a startup dependency of the TCF agent.
+Debug Infineon AURIX&trade; firmware in VS Code, using the normal debugging UI or
+an AI assistant connected through MCP. Both operate on the **same debug session**.
 
-VS Code extension for debugging Infineon AURIX&trade; devices. It supports all AURIX&trade; TC2x, TC3x, and TC4x microcontrollers, including their TriCore, PPU, and CDSP cores.
+The extension uses the TCF backend from [AURIX&trade; Configuration Studio](https://www.infineon.com/design-resources/platforms/aurix-software-tools/aurix-configuration-studio).
+It supports debugging AURIX TC2x, TC3x and TC4x devices, with UI configuration for
+TriCore, PPU and CDSP cores. See [MCP capabilities](#what-you-can-do-with-mcp) for
+the current MCP coverage.
 
 ## Features
 
-- Multi-core debugging
-- Line breakpoints and instruction/address breakpoints
-- Step in/out, step over, continue/pause, restart, terminate
-- Peripheral view (read and write SVD registers)
-- Reset and halt at first breakpoint
-- Call stack and variables
-- Live watch of global variable
-- Disassembly view
-- Instruction stepping mode 
-- Memory Inspector (read and write memeory)
-- Launch configuration with AURIX&trade; device detect button
-- Debug the PPU and CDSP cores
-- Optional pre-debug ELF flashing, including PPU/CDSP HEX files
+- Multicore debugging with source and instruction breakpoints
+- Continue, pause, step into/over/out, restart and terminate
+- Call stacks, variables, Watch and Live Watch
+- Disassembly, instruction stepping, Peripheral Viewer and Memory Inspector
+- A configuration panel with device detection and saved Run and Debug / F5 configurations
+- Optional pre-debug flashing, including PPU/CDSP HEX files
+- AI-assisted debugging through the built-in Debug MCP server
 
 ## Requirements
 
-- Visual Studio Code 1.79.0 or higher
-- DAS 8.3.0.1
-- Peripheral Inspector extension (installed automatically as a dependency)
-- Memory Inspector extension (installed automatically as a dependency)
-
-## Backend binaries (`bin/`)
-
-The backend tools live under `bin/` and are bundled with this repository:
-
-- `aurix-debugger.exe` — the TCF agent
-- `aurixflasher/` — AURIX Flasher and its supporting files, required by the TCF agent at startup
-- `lsmcdd.exe`, `mcdxdas.dll` — DAS components
-- `svd/` — SVD files for the supported devices
-
-Keep the complete `bin/aurixflasher/` directory beside `bin/aurix-debugger.exe` when packaging or deploying the extension, even for debug-only sessions. The extension starts the agent with its containing directory as the working directory.
-
-These tools come from [AURIX&trade; Configuration Studio](https://www.infineon.com/design-resources/platforms/aurix-software-tools/aurix-tools/aurix-configuration-studio) and are not covered by this project's MIT license. Their applicable licenses must be checked separately; the notices under `bin/aurixflasher/license/` do not establish licensing for the debugger, DAS components or SVD files.
-
-### Flashing support
-
-Select **Enable flashing** in the configuration panel, or set `enableFlashing: true`, to flash `program` with the bundled AURIX Flasher before starting the debug session. This option defaults to `false`; leave it disabled to debug firmware already on the target.
-
-With **Enable flashing** selected, PPU/CDSP **Flash Hex** (`ppuFlashHex` / `cdspFlashHex`) adds the corresponding `.hex` files beside the configured ELFs to the same flasher invocation. Generate these HEX files before debugging; the extension does not convert them. Missing files stop launch with an explicit error. ELF files continue to provide debug symbols.
-
-The flasher resolves `targetDevice` through `lsmcdd.exe` and runs with `-gui off -elf <program> [-hex <file> ...] -start off -ver on -id <deviceId>`. If no device is configured, exactly one connected device is required. Output is shown in **AURIX Flasher**. **As in the original workflow, a failed flash retries once with `-erase all`, which may erase existing target flash contents.** If the retry fails, debugging does not start.
-
-Before flashing on Restart, the extension stops its previously owned agent to release the DAS connection. Externally managed agents are not stopped; release their target connection before using integrated flashing. The updated backend binaries and restored flashing workflow still require hardware validation.
-
-With `autoStartAgent=true`, each debug session (including VS Code Restart) starts a fresh agent after the previous owned process and port have closed. This prevents stale launch arguments and breakpoints from carrying into a new session. Externally managed agents (`autoStartAgent=false`) are not restarted by this policy.
-
-## Build
-
-```bash
-npm install
-npm run package
-```
-
-`npm run package` compiles the TypeScript sources, copies the static assets, and produces `vscode-aurix-tcf-debug.vsix` in the project root.
-
-## Testing
-
-Run `npm run test:unit` for offline checks. ACS-derived hardware regression tests require an explicit, calibrated board profile and never flash automatically. See [TESTING.md](TESTING.md) for setup, commands and coverage boundaries, and [ACS_TEST_MAP.md](ACS_TEST_MAP.md) for case traceability.
+- Visual Studio Code 1.102.0 or higher
+- DAS 8.3.0.1 and a connected target for hardware debugging
+- Peripheral Viewer and Memory Inspector extensions (installed automatically as dependencies)
+- For MCP: a trusted, local Windows workspace and an MCP-capable AI client
+- For the optional skill: a client with Agent Skills support; use a recent VS Code/Copilot version
 
 ## Installation
 
-### Install from VSIX
-
-1. Build the project (see above) or download the `.vsix` from [Releases](https://github.com/ZeZhan/vscode-aurix-tcf-debugger/releases)
-2. Open the Extensions view by selecting the Extensions icon in the Activity Bar, or use the (`Ctrl+Shift+X`) keyboard shortcut.
-3. Click `...` and choose "Install from VSIX..."
-4. Select the `.vsix` file
-5. Open Command Palette and run `Developer: Reload Window`
+1. Download the `.vsix` from [Releases](https://github.com/ZeZhan/vscode-aurix-tcf-debugger/releases), or build it as described below.
+2. Open the Extensions view (`Ctrl+Shift+X`).
+3. Select **... > Install from VSIX...** and choose the file.
+4. Reload VS Code when prompted.
 
 ## Usage
 
 ### Debug configuration (UI)
 
-1. Open Command Palette and run `AURIX™ TCF: Open Debug Configuration`
-2. Fill in the fields and save the configuration
-3. Click `Debug` to start debugging
+1. Open your firmware project in VS Code.
+2. Run **AURIX&trade; TCF: Open Debug Configuration** from the Command Palette.
+3. Select your ELF and use **Detect** to select the connected device. Configure any additional cores as needed.
+4. Click **Debug**. Leave **Enable flashing** off if the firmware is already programmed.
+
+Clicking **Debug** saves or updates the first AURIX entry in
+`.vscode/launch.json` in the first workspace folder. You can then select it in
+**Run and Debug** and launch it with **F5**. Existing configurations and extra
+fields are retained; save any unsaved launch-file edits before starting.
+
+**Apply** remembers panel values but does not save the launch file. F5 uses
+launch-file settings such as tasks; the panel's Debug action uses its own settings.
 
 ![Debug Configuration](media/debug-configuration.png)
 
+### Start debugging
+
+Use the configuration panel's **Debug** button, or select a saved configuration
+in **Run and Debug** and press **F5**.
+
+![how-to-start](media/how-to-start.gif)
+
 ### Or create launch.json manually
 
-Create `.vscode/launch.json`:
+**New:** The first time you click **Debug** in **Debug Configuration**, the
+extension automatically creates `.vscode/launch.json` or updates an existing
+AURIX entry. You can use **F5** afterward without writing the configuration yourself.
+
+If you prefer to configure it manually, create `.vscode/launch.json` and replace the ELF path, device name and entry
+function with the values for your project. Use the exact DAS name shown by
+**Detect** for `targetDevice`, then press **F5** to start.
 
 ```json
 {
@@ -102,94 +82,192 @@ Create `.vscode/launch.json`:
       "host": "127.0.0.1",
       "port": 1534,
       "autoStartAgent": true,
-      "program": "${workspaceFolder}\\temp\\TC375_CE\\TriCore Debug (GCC)\\TC375_CE.elf",
-      "targetDevice": "DAS JDS AURIX LITE KIT V2.0 (TC375) LK8PIMU6",
+      "program": "${workspaceFolder}\\build\\TC375.elf",
+      "targetDevice": "<exact DAS device name>",
       "entryFunction": "core0_main",
-      "svdFile": "",
-      "workspace": "${workspaceFolder}\\temp\\TC375_CE",
+      "workspace": "${workspaceFolder}",
+      "enableFlashing": false
     }
   ]
 }
 ```
 
-### Start debugging
+### Flashing support
 
-We suggest start debugging with `AURIX™ TCF: Open Debug Configuration`
+Select **Enable flashing** to program the selected ELF before debugging.
+Flashing is off by default. For PPU/CDSP images, **Flash Hex** also programs the
+matching `.hex` files beside their ELFs; generate those files beforehand.
 
-![how-to-start](media/how-to-start.gif)
+**Warning:** If the first flash attempt fails, the extension retries once with
+a full erase, which may erase existing target flash contents. Flashing output
+is shown in **AURIX Flasher**.
 
-### Multicore breakpoint stops
+### AI-assisted debugging (MCP)
 
-Breakpoint notifications advertise all cores stopped only after fresh native state queries confirm every execution context is suspended. The debugger preserves the hit core as the focus and does not force other cores to halt during this verification. If confirmation fails, the Debug Console reports the problem and the notification does not claim an all-core stop. Pending verification is invalidated on resume, reset or disconnect. See [TESTING.md](TESTING.md) for the three-core hardware regression results.
+You can ask the AI to use an existing debug session or start one for you.
+**You do not need to start debugging manually first.**
 
-### Stopped core and source focus
+```text
+Check existing sessions
+  +-- Session found: reuse it and debug
+  +-- No session: check ELF, device and SVD -> ask for approval -> start and debug
+```
 
-Breakpoint and step stops select the corresponding core/frame in CALL STACK. Passive sibling-core pause notifications preserve that selection. When a frame is selected, its recorded source location is revealed alongside disassembly without taking keyboard focus; stale asynchronous source requests cannot override a newer selection. Source lookup uses the selected thread/frame, not the filename, so shared source files do not determine core selection. Manually switching source editor tabs does not switch debug cores.
+For a program that appears stuck:
+
+> My program gets stuck after startup. Use the current debug session to find
+> where it is waiting and which variable or condition is preventing progress.
+> Ask before resuming or stepping.
+
+To investigate a problem without starting a session yourself:
+
+> The LED on my board does not blink. Help me debug this project: check whether
+> initialization and the main loop run, and whether the output configuration
+> matches the code. The firmware is already flashed; ask before starting or
+> changing execution, and do not write registers.
+
+MCP startup does not build, flash or run launch-file tasks. Build and flash the
+firmware separately first. Starting a session may reset or run the target;
+variable and register inspection requires all reported cores to be stopped.
+
+Debug MCP is available automatically in a trusted local Windows workspace.
+If it is missing, check **MCP: List Servers**. To turn it off, set
+`aurix-tcf.mcp.enabled` to `false`.
+
+#### Install the optional Debug skill
+
+Run **AURIX&trade; TCF: Install / Update Debug Skill** from the Command Palette.
+This adds `.github/skills/aurix-debug-workflow/SKILL.md` to the chosen project,
+giving skill-capable clients a debugging workflow. AURIX AI Agent is not required.
+It does not start a session. Run the same command to update the skill; replacing
+an existing file requires confirmation.
+
+#### Approvals
+
+- Your AI client may ask you to trust the MCP server or approve tool calls.
+  Use **Chat: Manage Tool Approval**, where available, to manage individual tools
+  rather than approving every call separately. Tell the AI whether it may pause,
+  continue, step or change breakpoints for your task.
+- Once you allow temporary breakpoints for a task, the skill does not ask again
+  for each addition or cleanup. Your existing breakpoints are kept unless you
+  authorize a change. Client tool approvals are separate and may still appear.
+- Peripheral-register writes always require a separate **Write once**
+  confirmation in the Debugger.
+
+#### What you can do with MCP
+
+- List, start and terminate debug sessions, or reuse a session started from the UI.
+- Pause, resume, and step into, over or out of a function using the current stepping mode.
+- List, add and remove source breakpoints, shared with the VS Code UI.
+- Inspect core states, call stacks, local variables, globals and file-static variables.
+- Read bounded memory ranges, core registers and peripheral registers.
+- Read up to 8 globals and 32 named peripheral registers together with
+  `debug_observe`, reducing repeated tool calls without reusing stale handles.
+- Write a peripheral register with your explicit approval for each write.
+
+Batch observations require all cores stopped; they never run the target or write
+data. Any failure rejects the batch, and readings are not atomic with peripherals.
+
+MCP startup currently supports **TriCore**; full PPU/CDSP support is not yet
+available. It does not flash, evaluate arbitrary expressions or write general
+memory or core registers. Use an ELF matching the programmed firmware; MCP
+cannot automatically verify that match.
+
+### Multicore stops and source focus
+
+Use **CALL STACK** to select a core and frame. Source and disassembly views
+follow that selection; switching editor tabs does not switch debug cores.
+Check the reported state of each core rather than assuming a breakpoint has
+stopped every core.
 
 ### Watch global variables
 
-Variables and expressions can be watched in the Run and Debug view's **WATCH** section.
+Add variables and expressions in the Run and Debug view's **WATCH** section.
+Unavailable values are reported rather than replaced with guessed values.
 
 ![add-to-watch](media/add-to-watch.gif)
 
 ### Live Watch View
 
-The Live Watch view periodically refreshes selected global variables. Use the view's Settings button to configure the refresh interval (the minimum enforced value is 200 ms).
-
-Once configured, the active interval appears in the view header (highlighted in orange). Resume the target to run the cores and observe the selected global variables update automatically.
+Use the Live Watch view to refresh selected global variables while the target
+runs. Its Settings button controls the refresh interval (minimum 200 ms).
+The active interval is shown in the view header.
 
 ![live-watch](media/live-watch.gif)
 
 ### Peripheral View
 
-This Peripheral View depends on the extension `mcu-debug.peripheral-viewer`. A SVD file is needed to enable this view and to keep it in sync with the target.
+The Peripheral Viewer uses the matching SVD automatically, or a file you select.
+Register access depends on the device, SVD permissions and backend support.
+Pause the target before reading; cached or default display values are not proof
+of a successful read.
 
 ![peripheral-view](media/peripheral-view.gif)
 
 ### Memory Inspector
 
-The extension depends on `eclipse-cdt.memory-inspector`. Use the Command Palette and run
-`Memory Inspector: Show Memory Inspector` to open the view, then enter an
-address or expression once the target is paused.
+While paused, run **Memory Inspector: Show Memory Inspector** from the Command
+Palette, then enter an address or expression.
 
 ![memory-view](media/memory-view.gif)
 
 ### Disassembly View & Instruction Stepping Mode
 
-The extension does not automatically open Disassembly or split, lock or resize editor groups when debugging starts. To open it manually while paused, right-click a source editor and choose **Open Disassembly View**. The view stays synchronized with the currently selected frame. The toolbar includes an `Enable Instruction Stepping` button, which allows stepping through the program's disassembly instructions.
-
-The former `aurix-tcf.autoOpenDisassemblyView`, `aurix-tcf.autoLockDisassemblyView` and `aurix-tcf.autoEvenEditorWidths` settings have been removed; existing values no longer have any effect. CALL STACK selection and source reveal still follow the selected core/frame.
-
-In instruction mode, Step Into enters a call and Step Over executes over it. Unavailable disassembly entries are marked invalid with `<not decoded>` rather than fabricated instructions or opcode bytes. See [TESTING.md](TESTING.md) for hardware evidence and the known instruction Step Over user-breakpoint stop-reason limitation.
+While paused, right-click a source editor and select **Open Disassembly View**.
+The view follows the selected frame. Use **Enable Instruction Stepping** to
+step through instructions, and **Disable Instruction Stepping** to return to
+source-level stepping.
 
 ![enable-instruction-stepping](media/enable-instruction-stepping.gif)
 
-**Note:** If the `Enable Instruction Stepping` icon is grayed out, it indicates that instruction stepping is already enabled. To switch back to source code stepping, click the icon `Disable Instruction Stepping` again to disable instruction stepping.
+Set instruction breakpoints directly in the disassembly view, as you would in
+source code. A step can also stop at a user breakpoint.
 
 ![set-instruction-bp](media/set-instruction-bp.gif)
 
-Instruction breakpoints can be set in the same way as in the source code.
-
-If the disassembly view is closed, use the Command Palette and run `Open Disassembly View` to open the view
-
 ### PPU / CDSP Cores
 
-In addition to the TriCore cores, the debugger supports the cores: **PPU** and **CDSP**. Open `AURIX™ TCF: Open Debug Configuration` and switch to the **PPU/CDSP/SCR Cores** tab to assign an ELF file to each core:
+For UI debugging, open the **PPU/CDSP/SCR Cores** tab in the configuration panel
+and assign the ELF files used for debug symbols:
 
-- **PPU** — a single ELF file
-- **CDSP** — up to 12 ELF files (CDSP0 – CDSP11)
+- **PPU**: one ELF file
+- **CDSP**: up to 12 ELF files (CDSP0 through CDSP11)
 
-The assigned ELF files provide the debug symbols used for source-level debugging on the corresponding core.
+To program these images through integrated flashing, use the corresponding
+**Flash Hex** option as described in [Flashing support](#flashing-support).
+These UI features do not imply complete PPU/CDSP support in the MCP tools.
 
 ![cores-configuration](media/cores-configuration.png)
 
-#### Flash Hex option
+## Build from source
 
-PPU/CDSP **Flash Hex** controls are disabled while integrated flashing is unavailable. Configure the ELF files for debug symbols and program the firmware externally.
+Development requires Node.js 20 or newer. End users do not need a separate
+Python or Node.js installation for Debug MCP.
 
+```bash
+npm ci
+npm run package
+```
+
+The package command builds `vscode-aurix-tcf-debug.vsix` in the project root.
+
+## Backend binaries
+
+The bundled `bin/` directory contains the TCF agent, AURIX Flasher, DAS components
+and SVD files. Keep the complete `bin/aurixflasher/` directory beside
+`bin/aurix-debugger.exe`, even for debug-only use: it is a startup dependency.
+
+These tools come from AURIX&trade; Configuration Studio and are not covered by
+this project's MIT license. Their applicable licenses must be checked
+separately; the notices under `bin/aurixflasher/license/` do not establish
+licensing for the debugger, DAS components or SVD files.
 
 ## License
 
-The code in this repository is released under the MIT License - see [`LICENSE`](LICENSE).
+The code in this repository is released under the MIT License - see
+[`LICENSE`](LICENSE).
 
-The prebuilt tools under `bin/` are not covered by that license. They come from AURIX&trade; Configuration Studio and keep their own licenses - see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+The prebuilt tools under `bin/` retain their own licenses. See
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+**Known issue:** If the target is already running, the TCF agent may fail to start when flashing is disabled and no stop-at-function (`entryFunction`) is configured.

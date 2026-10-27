@@ -10,6 +10,8 @@ README_DEV.md
 .env.test
 *.local.json
 test-results/
+# Test sources (kept locally)
+/src/test/
 /ACS_TEST_MAP.md
 /TESTING.md
 /scripts/export-acs-map.ps1
@@ -17,5 +19,6 @@ test-results/
 /scripts/run-test.ps1
 /scripts/tc375.example.json
 /scripts/test-tc375.ps1
+/scripts/test-peripheral-viewer.cjs
 # Runtime log produced by the agent
 bin/AGENT_LOG.TXT

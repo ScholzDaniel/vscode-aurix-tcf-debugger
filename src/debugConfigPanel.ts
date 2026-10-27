@@ -3,12 +3,13 @@
  */
 
 import * as vscode from 'vscode';
-import { execFile } from 'child_process';
+import { listDasDevices } from './deviceDiscovery';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getSvdOptionsForDevice } from './svdCatalog';
 import { collectFlashHexFiles } from './flashing';
 import { resolveConfigPath } from './configPaths';
+import { savePanelLaunchConfiguration } from './panelLaunchConfiguration';
 
 function esc(s: string): string {
 	return s
@@ -173,6 +174,12 @@ export async function showDebugConfigPanel(context: vscode.ExtensionContext): Pr
 				return;
 			}
 
+			try {
+				await savePanelLaunchConfiguration(folder, msg.config as vscode.DebugConfiguration);
+			} catch (error) {
+				void vscode.window.showErrorMessage(`Cannot save launch.json: ${error instanceof Error ? error.message : String(error)}`);
+				return;
+			}
 			await vscode.debug.startDebugging(folder, msg.config as vscode.DebugConfiguration);
 		}
 	}, undefined, context.subscriptions);
@@ -200,66 +207,8 @@ type AurixPanelDefaults = {
 	values: AurixPanelValues;
 };
 
-function parseCsvLine(line: string): string[] {
-	const fields: string[] = [];
-	let current = '';
-	let inQuotes = false;
-	for (let i = 0; i < line.length; i++) {
-		const ch = line[i];
-		if (ch === '"') {
-			if (inQuotes && line[i + 1] === '"') {
-				current += '"';
-				i++;
-				continue;
-			}
-			inQuotes = !inQuotes;
-			continue;
-		}
-		if (ch === ',' && !inQuotes) {
-			fields.push(current.trim());
-			current = '';
-			continue;
-		}
-		current += ch;
-	}
-	fields.push(current.trim());
-	return fields;
-}
-
-// Extract device names from lsmcdd.exe output.
-function parseDeviceNames(output: string): string[] {
-	const names = new Set<string>();
-	for (const rawLine of output.split(/\r?\n/)) {
-		const line = rawLine.trim();
-		if (!line) {
-			continue;
-		}
-		const fields = parseCsvLine(line);
-		const name = (fields[1] ?? '').trim();
-		if (name) {
-			names.add(name);
-		}
-	}
-	return Array.from(names);
-}
-
-// Run lsmcdd.exe to list connected devices.
 async function listConnectedDevices(context: vscode.ExtensionContext): Promise<string[]> {
-	const exePath = path.join(context.extensionPath, 'bin', 'lsmcdd.exe');
-	if (!fs.existsSync(exePath)) {
-		throw new Error(`lsmcdd.exe not found at ${exePath}`);
-	}
-	const output = await new Promise<string>((resolve, reject) => {
-		execFile(exePath, { windowsHide: true }, (err, stdout, stderr) => {
-			const combined = (stdout && stdout.trim().length > 0) ? stdout : (stderr ?? '');
-			if (err && (!combined || combined.trim().length === 0)) {
-				reject(new Error((stderr || err.message || 'Unknown error').trim()));
-				return;
-			}
-			resolve(combined ?? '');
-		});
-	});
-	return parseDeviceNames(output);
+	return [...new Set((await listDasDevices(context.extensionPath)).map(device => device.name))];
 }
 
 // Persist the last-used panel values.
@@ -455,7 +404,7 @@ function getHtml(defaults: AurixPanelDefaults): string {
 </head>
 <body>
 	<h2>AURIX™ TCF Debug Configuration</h2>
-	<div class="small">Starts a debug session without editing launch.json.</div>
+	<div class="small">Click Debug to save the current configuration to launch.json and start debugging.</div>
 
 	<div class="tabs" role="tablist">
 		<button type="button" class="tabBtn active" data-tab="project">Project</button>
@@ -583,6 +532,10 @@ function getHtml(defaults: AurixPanelDefaults): string {
 				: [];
 
 			select.innerHTML = '';
+			const automatic = document.createElement('option');
+			automatic.value = '';
+			automatic.textContent = 'Auto';
+			select.appendChild(automatic);
 
 			for (const item of normalized) {
 				const opt = document.createElement('option');
