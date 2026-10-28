@@ -64,7 +64,10 @@ export class DebugMcpRegistration implements vscode.Disposable {
 			},
 			confirmPeripheralWrite: (approval, signal) => this.confirmPeripheralWrite(approval, signal),
 			reportError: error => this.report(error),
-			reserveStart: (id, signal) => this.lifecycle.reserveStart(id, signal),
+			reserveStart: (id, signal, onProgress) => this.lifecycle.reserveStart(id, signal, progress => {
+				onProgress?.(progress);
+				this.output.appendLine(`[debug_start] ${JSON.stringify({ launchId: id, ...progress })}`);
+			}),
 			startSession: async (options, id) => {
 				const folders = (vscode.workspace.workspaceFolders ?? []).filter(folder => folder.uri.scheme === 'file');
 				const config = await createMcpLaunchConfiguration(options, folders.map(folder => folder.uri.fsPath), id);
@@ -73,7 +76,15 @@ export class DebugMcpRegistration implements vscode.Disposable {
 				this.lifecycle.checkConfiguration(config);
 				const folder = folders.find(folder => path.relative(folder.uri.fsPath, options.workspaceFolder) === '');
 				if (!folder || !this.allowed()) { throw new DebugMcpError('START_UNAVAILABLE', 'The workspace changed or Debug MCP was disabled during startup.'); }
-				return vscode.debug.startDebugging(folder, config);
+				let accepted: boolean;
+				try {
+					accepted = await vscode.debug.startDebugging(folder, config);
+				} catch (error) {
+					throw this.lifecycle.startFailure(id) ?? error;
+				}
+				const failure = this.lifecycle.startFailure(id);
+				if (failure) { throw failure; }
+				return accepted;
 			},
 			breakpoints: () => vscode.debug.breakpoints
 				.filter((bp): bp is vscode.SourceBreakpoint => bp instanceof vscode.SourceBreakpoint)

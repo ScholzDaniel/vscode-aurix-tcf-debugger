@@ -24,7 +24,7 @@ import { resolveConfigPath } from './configPaths';
 import { DebugMcpRegistration } from './mcp/extension';
 import { preparePeripheralLaunch, preparedPeripheralAgentSvd } from './peripheralProfile';
 import { AgentRelease, DebugMcpError } from './mcp/debugController';
-import { DebugLifecycleGate } from './mcp/launch';
+import { DebugLifecycleGate, type DebugStartStage } from './mcp/launch';
 import { waitForProcessExit, waitForTcpPortClosed } from './agentLifecycle';
 
 let tcfAgentProcess: ChildProcess | undefined;
@@ -363,7 +363,21 @@ export function activate(context: vscode.ExtensionContext) {
 export class AurixTCFDebugAdapterFactory implements vscode.DebugAdapterDescriptorFactory {
     // Create the debug adapter descriptor for a debug session
 	async createDebugAdapterDescriptor(session: vscode.DebugSession): Promise<vscode.ProviderResult<vscode.DebugAdapterDescriptor>> {
-		debugLifecycle.beginSession(session.id, session.configuration);
+		const config = session.configuration;
+		const launchId = config.__aurixMcpLaunchId;
+		const mcpLaunch = typeof launchId === 'string';
+		const startup: { stage: DebugStartStage } = { stage: 'configuration' };
+		let flashAttempts = 0;
+		let flashCompleted = false;
+		const setStage = (value: DebugStartStage) => {
+			startup.stage = value;
+			debugLifecycle.reportStartProgress(launchId, { stage: value });
+		};
+		try { debugLifecycle.beginSession(session.id, config); }
+		catch (error) {
+			debugLifecycle.reportStartFailure(launchId, error, startup.stage);
+			throw error;
+		}
 		startingAurixSessions++;
 		// VS Code Restart can create a new session/adapter before firing onDidStartDebugSession.
 		// Cancel any pending shutdown early so we don't kill the agent mid-start.
@@ -374,14 +388,25 @@ export class AurixTCFDebugAdapterFactory implements vscode.DebugAdapterDescripto
 			agentOutput?.appendLine('Cancelled pending agent shutdown (session is starting).');
 		}
 		try {
-		const config = session.configuration;
-
 		try {
 			const plan = createFlashingPlan(config, value => resolveConfigPathFromFolder(session.workspaceFolder, value));
 			if (plan) {
+				if (mcpLaunch) {
+					setStage('device-validation');
+					await validateAgentTargetDevice(config.targetDevice, true);
+					debugLifecycle.checkConfiguration(config);
+				}
+				setStage('flashing');
 				// Release the previous session's DAS connection before flashing on Restart.
 				await stopTCFAgent('pre-debug flashing');
-				await runAurixFlasher(plan.elfPath, typeof config.targetDevice === 'string' ? config.targetDevice : undefined, plan.hexFiles);
+				await runAurixFlasher(plan.elfPath, typeof config.targetDevice === 'string' ? config.targetDevice : undefined, plan.hexFiles,
+					mcpLaunch ? () => debugLifecycle.checkConfiguration(config) : undefined,
+					mcpLaunch ? eraseAll => {
+						flashAttempts++;
+						debugLifecycle.reportStartProgress(launchId, { flashStatus: 'running', flashAttempts, eraseAllRetried: eraseAll });
+					} : undefined);
+				flashCompleted = true;
+				debugLifecycle.reportStartProgress(launchId, { flashStatus: 'completed' });
 			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -392,6 +417,8 @@ export class AurixTCFDebugAdapterFactory implements vscode.DebugAdapterDescripto
 
 		// Auto-start TCF agent if requested
 		if (config.autoStartAgent) {
+			setStage('device-validation');
+			debugLifecycle.checkConfiguration(config);
 			// Preflight: validate targetDevice early so typos fail fast.
 			if (typeof config.targetDevice === 'string' && config.targetDevice.trim() !== '') {
 				try {
@@ -470,7 +497,9 @@ export class AurixTCFDebugAdapterFactory implements vscode.DebugAdapterDescripto
 			const port = config.port || 1534;
 
 			debugLifecycle.checkConfiguration(config);
+			setStage('agent-startup');
 			await startTCFAgent(agentPath, agentArgs, host, port);
+			debugLifecycle.reportStartProgress(launchId, { agentReady: true });
 			if (tcfAgentProcess) {
 				sessionAgents.set(session.id, { process: tcfAgentProcess, host, port });
 				if (sessionAgents.size > 64) {
@@ -487,14 +516,24 @@ export class AurixTCFDebugAdapterFactory implements vscode.DebugAdapterDescripto
 
 		const enablePathMapper = vscode.workspace.isTrusted && pathMapperConfig === true;
 		
+		setStage('adapter-startup');
 		return new vscode.DebugAdapterInlineImplementation(new AurixTCFDebugSession(enablePathMapper));
 		} catch (error) {
 			debugLifecycle.endSession(session.id);
-			if (typeof session.configuration.__aurixMcpLaunchId === 'string') {
-				try { await stopTCFAgent('MCP launch failed'); }
-				catch (cleanupError) { throw new Error(`${String(error)}; owned Agent cleanup also failed: ${String(cleanupError)}`); }
+			if (startup.stage === 'flashing' && flashAttempts > 0 && !flashCompleted) {
+				debugLifecycle.reportStartProgress(launchId, { flashStatus: 'failed' });
 			}
-			throw error;
+			let failure = error;
+			if (mcpLaunch) {
+				try { await stopTCFAgent('MCP launch failed'); }
+				catch (cleanupError) {
+					failure = new DebugMcpError(error instanceof DebugMcpError ? error.code : startup.stage === 'flashing' ? 'FLASH_FAILED' : 'START_FAILED',
+						`${error instanceof Error ? error.message : String(error)}; owned Agent cleanup also failed: ${String(cleanupError)}`,
+						{ ...(error instanceof DebugMcpError ? error.details : {}), cleanupError: String(cleanupError) });
+				}
+			}
+			debugLifecycle.reportStartFailure(launchId, failure, startup.stage);
+			throw failure;
 		} finally {
 			startingAurixSessions = Math.max(0, startingAurixSessions - 1);
 		}
@@ -534,7 +573,9 @@ async function validateAgentTargetDevice(targetDevice: string, strict = false): 
 	}
 }
 
-async function runAurixFlasher(elfPath: string, targetDevice: string | undefined, hexFiles: string[]): Promise<void> {
+async function runAurixFlasher(elfPath: string, targetDevice: string | undefined, hexFiles: string[],
+	check?: () => void, onAttempt?: (eraseAll: boolean) => void): Promise<void> {
+	check?.();
 	const flasherExe = path.join(extensionContext.extensionPath, 'bin', 'aurixflasher', 'aurixflasher.exe');
 	if (!fs.existsSync(flasherExe)) {
 		throw new Error(`aurixflasher.exe not found: ${flasherExe}`);
@@ -548,9 +589,11 @@ async function runAurixFlasher(elfPath: string, targetDevice: string | undefined
 	const device = selectFlasherDevice(await listLsmcddDevices(), targetDevice);
 	const args = buildFlasherArgs(elfPath, hexFiles, device);
 
-	const run = (commandArgs: string[]): Promise<number> => {
+	const run = (commandArgs: string[], eraseAll = false): Promise<number> => {
+		check?.();
 		flasherOutput?.appendLine(`Command: ${flasherExe} ${commandArgs.join(' ')}`);
 		return new Promise((resolve, reject) => {
+			onAttempt?.(eraseAll);
 			execFile(flasherExe, commandArgs, {
 				cwd: path.dirname(flasherExe), windowsHide: true, maxBuffer: 20 * 1024 * 1024,
 			}, (error, stdout, stderr) => {
@@ -569,9 +612,10 @@ async function runAurixFlasher(elfPath: string, targetDevice: string | undefined
 
 	let exitCode = await run(args);
 	if (exitCode !== 0) {
+		check?.();
 		// Preserve the original Eclipse-compatible erase-and-retry behavior.
 		flasherOutput?.appendLine('Flashing failed, retrying with -erase all...');
-		exitCode = await run([...args, '-erase', 'all']);
+		exitCode = await run([...args, '-erase', 'all'], true);
 		if (exitCode !== 0) {
 			throw new Error(`Flashing failed even after erasing. Exit code: ${exitCode}`);
 		}
@@ -909,8 +953,15 @@ async function startTCFAgent(agentPath: string, args: string[], host: string, po
 	try {
 		await waitForTcpPort(host, port, 15_000);
 	} catch (error) {
-		await stopTCFAgent('agent startup failed');
-		throw error;
+		const failure = error instanceof DebugMcpError ? error :
+			new DebugMcpError('AGENT_START_FAILED', error instanceof Error ? error.message : String(error), { host, port });
+		agentOutput?.appendLine(`Agent startup failed (${failure.code}): ${failure.message}`);
+		try { await stopTCFAgent('agent startup failed'); }
+		catch (cleanupError) {
+			throw new DebugMcpError(failure.code, `${failure.message}; Agent cleanup also failed: ${String(cleanupError)}`,
+				{ ...failure.details, cleanupError: String(cleanupError) });
+		}
+		throw failure;
 	}
 	agentOutput?.appendLine(`TCF agent is listening on ${host}:${port}`);
 }
@@ -1006,7 +1057,8 @@ function waitForTcpPort(host: string, port: number, timeoutMs: number): Promise<
 
 			const retryOrFail = () => {
 				if (Date.now() >= deadline) {
-					reject(new Error(`Timed out waiting for ${host}:${port}`));
+					reject(new DebugMcpError('AGENT_START_TIMEOUT', `Timed out waiting for the TCF agent to listen on ${host}:${port} after ${timeoutMs} ms.`,
+						{ host, port, agentTimeoutMs: timeoutMs }));
 					return;
 				}
 				setTimeout(tryOnce, 150);
