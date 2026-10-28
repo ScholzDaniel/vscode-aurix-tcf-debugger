@@ -126,8 +126,14 @@ To investigate a problem without starting a session yourself:
 > matches the code. The firmware is already flashed; ask before starting or
 > changing execution, and do not write registers.
 
-MCP startup does not build, flash or run launch-file tasks. Build and flash the
-firmware separately first. Starting a session may reset or run the target;
+MCP startup does not build or run launch-file tasks. Build the ELF first.
+Flashing is off by default; explicitly request **flash and debug** to use the
+Debugger's existing flasher/download workflow (`debug_start` with `flash: true`).
+This includes the existing full-erase retry after a failed flasher attempt;
+authorize it only for the intended ELF and device, and do not flash separately first.
+For no-flash startup, an optional `entryFunction`, such as `core0_main`, requests
+the Agent's stop-at-function behavior. Verify the actual stopped location.
+Starting a session may reset or run the target;
 variable and register inspection requires all reported cores to be stopped.
 
 Debug MCP is available automatically in a trusted local Windows workspace.
@@ -157,6 +163,7 @@ an existing file requires confirmation.
 #### What you can do with MCP
 
 - List, start and terminate debug sessions, or reuse a session started from the UI.
+- Optionally flash the selected ELF as part of an explicitly authorized startup.
 - Pause, resume, and step into, over or out of a function using the current stepping mode.
 - List, add and remove source breakpoints, shared with the VS Code UI.
 - Inspect core states, call stacks, local variables, globals and file-static variables.
@@ -169,9 +176,15 @@ Batch observations require all cores stopped; they never run the target or write
 data. Any failure rejects the batch, and readings are not atomic with peripherals.
 
 MCP startup currently supports **TriCore**; full PPU/CDSP support is not yet
-available. It does not flash, evaluate arbitrary expressions or write general
+available. It does not build, evaluate arbitrary expressions or write general
 memory or core registers. Use an ELF matching the programmed firmware; MCP
 cannot automatically verify that match.
+
+Startup errors distinguish flashing failures from Agent startup failures.
+An Agent timeout at `127.0.0.1:1534` means it did not become ready within its
+15-second limit; increasing preparation time does not change that limit.
+Flasher completion alone does not prove a successful debug session or full-image
+verification. Do not automatically repeat a failed flash/start.
 
 ### Multicore stops and source focus
 

@@ -2,6 +2,11 @@
 
 Simple, human-readable release notes for this extension.
 
+## 0.1.29
+- Add explicit `debug_start` options for flashing through the existing UI workflow and requesting an Agent stop-at-function; default startup remains no-flash.
+- Return actual flash progress and phase-specific startup failures, including Agent port-readiness timeouts, instead of losing factory errors behind `START_REJECTED`.
+- Preserve the existing full-erase retry with explicit authorization guidance; prevent new flasher attempts after MCP cancellation and keep pending launches reserved.
+
 ## 0.1.28
 - Add read-only `debug_observe` for bounded global/peripheral batches with fresh identity resolution and shared execution-state checks; preserve existing tools.
 - Prefer batch observations in the Debug skill and avoid redundant discovery while retaining stop verification and explicit error reporting.

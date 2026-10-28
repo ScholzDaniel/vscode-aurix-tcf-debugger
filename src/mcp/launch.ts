@@ -10,9 +10,20 @@ export const launchOptionsSchema = z.object({
 	program: literal,
 	targetDevice: literal.max(256).refine(value => value === value.trim() && !/^\d+$/.test(value), 'Use the exact DAS device name, not a board model or numeric ID.'),
 	core: z.number().int().min(0).max(5),
+	flash: z.boolean().optional().describe('Default false. Set true only when the user explicitly authorizes programming this ELF before debugging, including the existing full-erase retry on a failed flasher attempt. Reuses the UI flasher/download flow; do not flash separately first.'),
+	entryFunction: z.string().min(1).max(256).regex(/^[A-Za-z_][A-Za-z0-9_]*$/).optional()
+		.describe('Optional exact C function identifier passed to the Agent as -e, e.g. core0_main. Useful for no-flash startup of a running target. Requested location only; inspect actual PC/stack after startup.'),
 	peripheralReadProfile: z.enum(['auto', 'disabled', peripheralProfileName]).optional().describe('MCP-only policy: auto shares the full matching SVD with the manual Viewer, preserving access/read-side-effect guards and requiring individual user approval for each write. disabled blocks MCP peripheral access; explicit legacy profile remains four-register read-only. No effect on manual access or flashing.'),
 }).strict();
 export type DebugLaunchOptions = z.infer<typeof launchOptionsSchema>;
+export type DebugStartStage = 'configuration' | 'device-validation' | 'flashing' | 'agent-startup' | 'adapter-startup' | 'waiting-for-stop' | 'stopped';
+export type DebugStartProgress = {
+	stage: DebugStartStage;
+	flashStatus: 'not-requested' | 'pending' | 'running' | 'completed' | 'failed';
+	flashAttempts: number;
+	eraseAllRetried: boolean;
+	agentReady: boolean;
+};
 
 export async function createMcpLaunchConfiguration(options: DebugLaunchOptions, roots: readonly string[], launchId: string) {
 	const input = launchOptionsSchema.parse(options);
@@ -25,7 +36,7 @@ export async function createMcpLaunchConfiguration(options: DebugLaunchOptions, 
 		const header = Buffer.alloc(4);
 		const { bytesRead } = await file.read(header, 0, header.length, 0);
 		if (bytesRead !== 4 || !header.equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) {
-			throw new DebugMcpError('INVALID_PROGRAM', 'program must be an existing ELF file. Build and flash the matching firmware separately first.');
+			throw new DebugMcpError('INVALID_PROGRAM', 'program must be an existing ELF file. Build it before starting; flashing requires explicit authorization.');
 		}
 	} finally {
 		await file.close();
@@ -34,9 +45,10 @@ export async function createMcpLaunchConfiguration(options: DebugLaunchOptions, 
 		type: 'aurix-tcf', request: 'launch', name: `AURIX MCP: ${input.targetDevice}`, noDebug: false,
 		workspace: input.workspaceFolder, program: input.program, targetDevice: input.targetDevice, core: input.core,
 		host: '127.0.0.1', port: 1534, autoStartAgent: true,
-		enableFlashing: false, flashDownload: false, stopOnEntry: true, resumeOtherCoresOnEntry: false,
+		enableFlashing: input.flash === true, flashDownload: input.flash === true, stopOnEntry: true, resumeOtherCoresOnEntry: false,
 		instructionStepping: false, liveWatchEnabled: false, enableConsoleLog: false,
 		__aurixMcpLaunchId: launchId,
+		...(input.entryFunction ? { entryFunction: input.entryFunction } : {}),
 		...(input.peripheralReadProfile ? { peripheralReadProfile: input.peripheralReadProfile } : {}),
 	};
 }
@@ -44,19 +56,35 @@ export async function createMcpLaunchConfiguration(options: DebugLaunchOptions, 
 // Shared with the normal factory: MCP must never restart an existing UI session's agent.
 export class DebugLifecycleGate {
 	private readonly sessions = new Set<string>();
-	private start?: { id: string; signal: AbortSignal; configuration?: Record<string, unknown>; sessionId?: string };
+	private start?: { id: string; signal: AbortSignal; configuration?: Record<string, unknown>; sessionId?: string;
+		failure?: DebugMcpError; onProgress?: (progress: Partial<DebugStartProgress>) => void };
 	private releasing?: string;
 
 	get busy(): boolean { return this.start !== undefined || this.releasing !== undefined; }
 
-	reserveStart(id: string, signal: AbortSignal): () => void {
+	reserveStart(id: string, signal: AbortSignal, onProgress?: (progress: Partial<DebugStartProgress>) => void): () => void {
 		if (this.busy || this.sessions.size) {
 			throw new DebugMcpError('BUSY', 'An AURIX session is active, starting or releasing its agent. Use the existing session or wait for debug_stop.');
 		}
 		signal.throwIfAborted();
-		const reservation = { id, signal };
+		const reservation = { id, signal, onProgress };
 		this.start = reservation;
 		return () => { if (this.start === reservation) { this.start = undefined; } };
+	}
+
+	reportStartProgress(id: unknown, progress: Partial<DebugStartProgress>): void {
+		if (this.start && this.start.id === id) { this.start.onProgress?.(progress); }
+	}
+
+	reportStartFailure(id: unknown, error: unknown, stage: DebugStartStage): void {
+		if (!this.start || this.start.id !== id) { return; }
+		const code = stage === 'flashing' ? 'FLASH_FAILED' : stage === 'agent-startup' ? 'AGENT_START_FAILED' : 'START_FAILED';
+		this.start.failure ??= error instanceof DebugMcpError ? error :
+			new DebugMcpError(code, error instanceof Error ? error.message : String(error), { stage });
+	}
+
+	startFailure(id: string): DebugMcpError | undefined {
+		return this.start?.id === id ? this.start.failure : undefined;
 	}
 
 	setConfiguration(id: string, configuration: Record<string, unknown>): void {
@@ -79,7 +107,7 @@ export class DebugLifecycleGate {
 		}
 		for (const key of Object.keys(configuration)) {
 			if (key in expected || key.startsWith('__') || key === 'liveWatchIntervalMs' || key === 'debugTCFMessages') { continue; }
-			throw new DebugMcpError('INVALID_LAUNCH', `MCP launch does not allow '${key}'. Tasks, extra agent options and flashing are not supported.`);
+			throw new DebugMcpError('INVALID_LAUNCH', `MCP launch does not allow '${key}'. Tasks, extra agent options and unrequested flashing are not supported.`);
 		}
 	}
 

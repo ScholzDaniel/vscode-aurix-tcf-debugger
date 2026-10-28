@@ -3,7 +3,7 @@ import { promises as fs } from 'fs';
 import { z } from 'zod';
 import { DapEvents } from '../dapEvents';
 import { randomUUID } from 'crypto';
-import type { DebugLaunchOptions } from './launch';
+import { launchOptionsSchema, type DebugLaunchOptions, type DebugStartProgress } from './launch';
 import type { DebugPreparation, DebugPrepareOptions, PreparationProgress } from './prepare';
 import { performance } from 'perf_hooks';
 import { setTimeout as delay } from 'timers/promises';
@@ -41,7 +41,7 @@ export interface DebugHost {
 	validateSource(source: string): Promise<void>;
 	addBreakpoint(source: string, line: number): SourceBreakpoint;
 	removeBreakpoint(id: string): void;
-	reserveStart(launchId: string, signal: AbortSignal): () => void;
+	reserveStart(launchId: string, signal: AbortSignal, onProgress?: (progress: Partial<DebugStartProgress>) => void): () => void;
 	startSession(options: DebugLaunchOptions, launchId: string): PromiseLike<boolean>;
 	stopSession(id: string): PromiseLike<AgentRelease>;
 	reportError(error: unknown): void;
@@ -328,7 +328,8 @@ export class DebugController {
 		}
 	}
 
-	async start(options: DebugLaunchOptions, signal: AbortSignal, timeoutMs = 60000) {
+	async start(options: DebugLaunchOptions, signal: AbortSignal, timeoutMs = options.flash ? 180000 : 60000) {
+		options = launchOptionsSchema.parse(options);
 		if (this.sessions.size || this.starting) {
 			throw new DebugMcpError('BUSY', 'An AURIX session already exists or is starting. Select it using debug_sessions; do not launch another backend.');
 		}
@@ -336,9 +337,20 @@ export class DebugController {
 		this.starting = attempt;
 		let entry: Entry | undefined;
 		let launched = false;
+		let progress: DebugStartProgress = {
+			stage: 'configuration', flashStatus: options.flash ? 'pending' : 'not-requested',
+			flashAttempts: 0, eraseAllRetried: false, agentReady: false,
+		};
+		const startupEvidence = () => ({
+			flashRequested: options.flash === true,
+			flashPerformed: progress.flashStatus === 'completed' ? true :
+				(progress.flashStatus === 'running' || progress.flashStatus === 'failed' ? null : false),
+			requestedEntryFunction: options.entryFunction ?? null,
+			startup: { ...progress },
+		});
 		try {
 			return await this.bounded(AbortSignal.any([signal, attempt.abort.signal]), timeoutMs, async inner => {
-				const release = this.host.reserveStart(attempt.launchId, inner);
+				const release = this.host.reserveStart(attempt.launchId, inner, update => { progress = { ...progress, ...update }; });
 				const mark = this.lifecycleEvents.mark();
 				const launch = Promise.resolve().then(() => {
 					inner.throwIfAborted();
@@ -356,6 +368,10 @@ export class DebugController {
 					]);
 					entry = this.entry(String(event.body?.sessionId));
 					const readyEntry = entry;
+					progress.stage = 'waiting-for-stop';
+					if (options.flash && progress.flashStatus !== 'completed') {
+						throw new DebugMcpError('FLASH_NOT_CONFIRMED', 'The launch returned without confirmation that the requested flasher operation completed.');
+					}
 					await readyEntry.events.waitFor('stopped', 0, timeoutMs, () => true, inner);
 					for (;;) {
 						inner.throwIfAborted();
@@ -367,9 +383,10 @@ export class DebugController {
 						const thread = cores[0];
 						const selectedStop = thread && readyEntry.events.since(0, 'stopped').filter(event => event.body?.threadId === thread.id).pop();
 						if (state.state === 'stopped' && thread?.suspended && selectedStop) {
+							progress.stage = 'stopped';
 							return { ...state, threadId: thread.id, core: options.core,
 								program: options.program, workspaceFolder: options.workspaceFolder, targetDevice: options.targetDevice,
-								flashPerformed: false, firmwareMatchVerified: false,
+								...startupEvidence(), firmwareMatchVerified: false,
 								stopMode: 'pauseAfterLaunch', entryLocationVerified: false,
 								event: { name: selectedStop.event, reason: selectedStop.body?.reason } };
 						}
@@ -391,7 +408,8 @@ export class DebugController {
 			const session = entry?.session ?? [...this.sessions.values()].find(value => value.session.launchId === attempt.launchId)?.session;
 			throw new DebugMcpError(error instanceof DebugMcpError ? error.code : 'START_FAILED',
 				`${error instanceof Error ? error.message : String(error)} Launch is not retried or rolled back. Use debug_sessions and debug_stop to recover.`,
-				{ launchId: attempt.launchId, sessionId: session?.id ?? attempt.sessionId });
+				{ ...(error instanceof DebugMcpError ? error.details : {}),
+					...startupEvidence(), firmwareMatchVerified: false, launchId: attempt.launchId, sessionId: session?.id ?? attempt.sessionId });
 		} finally {
 			// reserveStart can reject before there is a launch promise to release it.
 			if (!launched && this.starting === attempt) { this.starting = undefined; }

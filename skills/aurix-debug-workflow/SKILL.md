@@ -57,10 +57,17 @@ evidence, caveats and final session state.
    results, automatically retry or start from diagnostic-only partial data.
 4. `launchArguments` are advisory, not authorization or proof of flashed
    firmware. Confirm the workspace, built/flashed ELF, exact DAS name and core
-   before an authorized `debug_start`.
-5. `debug_start` never flashes, reads a saved launch configuration or executes
-   launch tasks. It can reset/run the target before its startup pause. A
-   `pauseAfterLaunch` stop is not verified run-to-entry.
+   before an authorized `debug_start`. Preparation itself never builds or flashes.
+5. `debug_start` defaults to no flashing. For an explicitly authorized
+   "flash and debug" request, use `flash: true` to reuse the Debugger's existing
+   flasher/download workflow; do not flash separately first. Confirm the ELF,
+   exact device and permission for the existing full-erase retry after a failed
+   flasher attempt. Do not turn a failed no-flash launch into flashing on your own.
+   Optional `entryFunction: "core0_main"` requests a stop-at-function and can be
+   used without flashing for the known running-target startup limitation.
+   It is a request, not proof of the stopped location. Never invent a function.
+   Startup never builds, reads a saved launch configuration or runs launch tasks.
+   It can reset/run the target; inspect actual PC/stack after its startup pause.
 6. Query `debug_status` and `debug_stack` to establish the actual core, PC and
    source location. Use returned session/thread IDs; thread IDs are not core
    indices. All reported cores must be stopped before data inspection.
@@ -154,6 +161,13 @@ samples, or claim a full cycle from endpoints alone.
 - On a launch or execution timeout, the operation may have happened. Do not
   automatically repeat it. Inspect `debug_sessions` and fresh `debug_status`;
   report uncertainty and seek a decision if recovery needs execution changes.
+- On startup failure, report `startup.stage`, flash status and the specific
+  error (for example `FLASH_FAILED` or `AGENT_START_TIMEOUT`). Flasher completion
+  does not imply Agent readiness, full-image verification or a stopped session.
+  `flashPerformed: null` means programming may be partial or still in flight;
+  do not report it as "no flash". The launch reservation blocks another start
+  until the pending operation settles. Increasing `debug_prepare.timeoutMs`
+  does not extend the Agent's separate 15-second port-readiness timeout.
 - On a read error, report the actual error and obtain fresh state before further
   inspection. Never present an unavailable value as zero or bypass a safety
   rejection. Respect any user instruction to stop after the first failure.
@@ -161,9 +175,11 @@ samples, or claim a full cycle from endpoints alone.
   `agent.agentReleased: true`. `debug_stop` is termination, not a CPU pause.
   External Agents need separate release; do not kill processes, force device
   ownership or proceed while release is unconfirmed.
-- Only use build/flash tools when separately available and authorized. With
-  Debugger alone, hand those steps to the user or their established workflow;
-  do not invent AURIX AI Agent tools or flash through a debug-tool workaround.
+- Builds require separately available build tools or the user's established
+  workflow. Flashing can use an authorized `debug_start` with `flash: true`, or
+  a separately available flash tool, not both for the same planned startup.
+  With an older Debugger lacking the flash option, hand flashing to the user or
+  their established workflow; never invent tools or bypass the MCP interface.
 - After a rebuild/flash, revalidate the new ELF and start a new authorized
   session. Reacquire handles and re-check breakpoints and observation points.
   A local ELF hash identifies the file, not the firmware on the board.
